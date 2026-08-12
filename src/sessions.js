@@ -68,9 +68,13 @@ export async function startSession(userId) {
   });
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    console.log(`📩 messages.upsert recibido — type: ${type}, cantidad: ${messages.length}`);
     if (type !== "notify") return;
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
+      if (!msg.message || msg.key.fromMe) {
+        console.log(`⏭️  Ignorado (sin contenido o es propio) — jid: ${msg.key.remoteJid}`);
+        continue;
+      }
       const jid = msg.key.remoteJid;
       if (jid.endsWith("@g.us")) continue;
 
@@ -79,12 +83,17 @@ export async function startSession(userId) {
         msg.message.extendedTextMessage?.text ||
         msg.message.imageMessage?.caption ||
         "";
-      if (!text.trim()) continue;
+      if (!text.trim()) {
+        console.log(`⏭️  Ignorado (sin texto) — jid: ${jid}`);
+        continue;
+      }
 
+      console.log(`✉️  Procesando mensaje de ${jid} (user ${userId}): "${text.trim()}"`);
       try {
         await handleInboundMessage(sock, userId, jid, text.trim());
+        console.log(`✅ handleInboundMessage terminó sin error para ${jid}`);
       } catch (err) {
-        console.error(`Error procesando mensaje de ${jid} (user ${userId}):`, err);
+        console.error(`❌ Error procesando mensaje de ${jid} (user ${userId}):`, err);
       }
     }
   });
