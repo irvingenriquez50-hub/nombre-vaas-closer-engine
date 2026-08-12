@@ -1,0 +1,84 @@
+import { supabase } from "./supabase.js";
+
+export async function getLead(userId, jid) {
+  const { data } = await supabase.from("leads").select("*").eq("user_id", userId).eq("jid", jid).maybeSingle();
+  return data;
+}
+
+export async function addLead(userId, phoneRaw) {
+  const digits = phoneRaw.replace(/[^0-9]/g, "");
+  const jid = `${digits}@s.whatsapp.net`;
+  const existing = await getLead(userId, jid);
+  if (existing) return { lead: existing, duplicate: true };
+
+  const { data, error } = await supabase
+    .from("leads")
+    .insert({ user_id: userId, phone: phoneRaw.trim(), jid, status: "nuevo" })
+    .select()
+    .single();
+  if (error) throw error;
+  return { lead: data, duplicate: false };
+}
+
+export async function upsertLeadPatch(userId, jid, patch) {
+  const { data, error } = await supabase
+    .from("leads")
+    .update({ ...patch, updated_at: new Date().toISOString() })
+    .eq("user_id", userId)
+    .eq("jid", jid)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+export async function appendMessage(userId, jid, role, content) {
+  const lead = await getLead(userId, jid);
+  const conversation = [...(lead?.conversation || []), { role, content, ts: Date.now() }];
+  return upsertLeadPatch(userId, jid, { conversation });
+}
+
+export async function listActiveLeads(userId) {
+  const { data } = await supabase
+    .from("leads")
+    .select("*")
+    .eq("user_id", userId)
+    .neq("status", "cerrado")
+    .neq("status", "dormant")
+    .eq("paused", false);
+  return data || [];
+}
+
+export async function logClosedDeal(userId, deal) {
+  const { data: lead } = await supabase
+    .from("leads")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("jid", deal.jid)
+    .maybeSingle();
+
+  await supabase.from("closed_deals").insert({
+    user_id: userId,
+    lead_id: lead?.id || null,
+    phone: deal.phone,
+    price: deal.price,
+    videos: deal.videos,
+  });
+}
+
+export async function getScript(userId) {
+  const { data } = await supabase.from("scripts").select("*").eq("user_id", userId).maybeSingle();
+  return {
+    message1: data?.message1 || "",
+    message2: data?.message2 || "You were recommended on the VAAS community for a paid collaboration.",
+  };
+}
+
+export async function getPricingTiers(userId) {
+  const { data } = await supabase.from("pricing_tiers").select("videos,anchor,floor").eq("user_id", userId);
+  return data || [];
+}
+
+export async function setBotSession(userId, patch) {
+  await supabase.from("bot_sessions").upsert({ user_id: userId, ...patch });
+}
