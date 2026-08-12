@@ -14,14 +14,8 @@ const HOURS_MSG2 = Number(process.env.HOURS_BEFORE_MESSAGE_2 || 24);
 const HOURS_ACCEPT = Number(process.env.HOURS_BEFORE_ACCEPT_LAST_OFFER || 24);
 const SEND_WINDOW_START_HOUR_CT = Number(process.env.SEND_WINDOW_START_HOUR_CT ?? 22);
 const SEND_WINDOW_END_HOUR_CT = Number(process.env.SEND_WINDOW_END_HOUR_CT ?? 7);
-const DEBOUNCE_MS = Number(process.env.REPLY_DEBOUNCE_MINUTES || 12) * 60 * 1000;
 
 const hoursSince = (ts) => (ts ? (Date.now() - new Date(ts).getTime()) / 3600000 : Infinity);
-
-// In-memory per-lead debounce timers, keyed by `${userId}:${jid}` — holds inbound
-// messages that arrive close together so the bot answers once with full context
-// instead of replying to each message separately mid-thought.
-const pendingReplies = new Map();
 
 function withinSendWindow() {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -58,13 +52,21 @@ export async function startProcessForNumber(sock, userId, phoneRaw) {
 }
 
 async function resolveAndSend(sock, userId, jid) {
+  console.log(`🟢 resolveAndSend ARRANCÓ para ${jid}`);
   const lead = await getLead(userId, jid);
-  if (!lead || lead.status === "cerrado" || lead.paused) return;
+  if (!lead || lead.status === "cerrado" || lead.paused) {
+    console.log(`⚠️  resolveAndSend: no se contesta a ${jid} (status: ${lead?.status}, paused: ${lead?.paused})`);
+    return;
+  }
 
+  console.log(`🤖 Llamando a la IA para generar la respuesta a ${jid}...`);
   const tiers = await getPricingTiers(userId);
+  console.log(`🤖 Tiers obtenidos: ${JSON.stringify(tiers)}`);
   const { replyText, closed, dormant, closedPrice, closedVideos } = await getNextMove(lead.conversation, tiers);
+  console.log(`🤖 IA respondió: "${replyText}" (closed: ${closed}, dormant: ${dormant})`);
 
   await sock.sendMessage(jid, { text: replyText });
+  console.log(`📤 Mensaje enviado a ${jid}`);
   await appendMessage(userId, jid, "assistant", replyText);
 
   if (closed) {
@@ -78,25 +80,29 @@ async function resolveAndSend(sock, userId, jid) {
   }
 }
 
-/** Called on every inbound WhatsApp message. Logs it immediately, then (re)starts a
- * debounce timer — the bot only actually replies once N minutes pass with no new
- * message, so a burst of texts gets answered together instead of one at a time. */
 export async function handleInboundMessage(sock, userId, jid, text) {
+  console.log(`🔍 handleInboundMessage: buscando lead para ${jid} (user ${userId})`);
   const lead = await getLead(userId, jid);
-  if (!lead || lead.status === "cerrado") return;
+  if (!lead || lead.status === "cerrado") {
+    console.log(`⚠️  No hay lead activo para ${jid} (encontrado: ${!!lead}, status: ${lead?.status}) — ignorando`);
+    return;
+  }
 
   await appendMessage(userId, jid, "user", text);
   await upsertLeadPatch(userId, jid, { last_inbound_at: new Date().toISOString() });
 
-  if (lead.paused) return; // a human took over this conversation by hand
+  if (lead.paused) {
+    console.log(`⏸️  Lead ${jid} está pausado — no se contesta`);
+    return;
+  }
 
-  const key = `${userId}:${jid}`;
-  if (pendingReplies.has(key)) clearTimeout(pendingReplies.get(key));
-  const timer = setTimeout(() => {
-    pendingReplies.delete(key);
-    resolveAndSend(sock, userId, jid).catch((err) => console.error(`Error respondiendo a ${jid} (user ${userId}):`, err));
-  }, DEBOUNCE_MS);
-  pendingReplies.set(key, timer);
+  console.log(`⚡ MODO PRUEBA V2: contestando de inmediato a ${jid}`);
+  try {
+    await resolveAndSend(sock, userId, jid);
+    console.log(`✅✅ resolveAndSend terminó completo para ${jid}`);
+  } catch (err) {
+    console.error(`❌❌ Error respondiendo a ${jid} (user ${userId}):`, err);
+  }
 }
 
 async function reportClosedDealToTracker(userId, deal) {
