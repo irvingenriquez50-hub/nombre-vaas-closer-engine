@@ -1,5 +1,4 @@
-import baileysPkg from "@whiskeysockets/baileys";
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = baileysPkg;
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import pino from "pino";
 import QRCode from "qrcode";
