@@ -62,7 +62,7 @@ export async function getNextMove(conversation, tiers) {
   const messages = conversation.map((m) => ({ role: m.role, content: m.content }));
 
   const response = await anthropic.messages.create({
-        model: "claude-sonnet-5",
+    model: "claude-sonnet-5",
     max_tokens: 300,
     system,
     messages,
