@@ -75,6 +75,95 @@ export async function startSession(userId) {
         console.log(`⏭️  Ignorado (sin contenido o es propio) — jid: ${msg.key.remoteJid}`);
         continue;
       }
+      const rawJid = msg.key.remoteJid;
+      if (rawJid.endsWith("@g.us")) continue;
+
+      const jid = rawJid.endsWith("@lid") && msg.key.senderPn ? msg.key.senderPn : rawJid;
+      if (jid !== rawJid) console.log(`🔀 remoteJid era @lid (${rawJid}), usando senderPn en su lugar: ${jid}`);
+
+      const text =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        msg.message.imageMessage?.caption ||
+        "";
+      if (!text.trim()) {
+        console.log(`⏭️  Ignorado (sin texto) — jid: ${jid}`);
+        continue;
+      }
+
+      console.log(`✉️  Procesando mensaje de ${jid} (user ${userId}): "${text.trim()}"`);
+      try {
+        await handleInboundMessage(sock, userId, jid, text.trim());
+        console.log(`✅ handleInboundMessage terminó sin error para ${jid}`);
+      } catch (err) {
+        console.error(`❌ Error procesando mensaje de ${jid} (user ${userId}):`, err);
+      }
+    }
+  });
+
+  return getSessionInfo(userId);
+}
+
+export function getSocketForUser(userId) {
+  return sessions.get(userId)?.sock || null;
+}
+
+export async function restoreExistingSessions() {
+  const base = path.resolve("data", "auth");
+  if (!fs.existsSync(base)) return;
+  const userIds = fs.readdirSync(base).filter((f) => fs.statSync(path.join(base, f)).isDirectory());
+  for (const userId of userIds) {
+    console.log(`Restaurando sesión guardada para ${userId}...`);
+    startSession(userId).catch((err) => console.error(`No se pudo restaurar sesión de ${userId}:`, err));
+  }
+}
+
+export function startGlobalSweep() {
+  setInterval(() => {
+    for (const [userId, entry] of sessions.entries()) {
+      if (!entry.connected) continue;
+      sweepTimers(entry.sock, userId).catch((err) => console.
+  sessions.set(userId, entry);
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      entry.qrDataUrl = await QRCode.toDataURL(qr);
+      entry.connected = false;
+      await setBotSession(userId, { qr_pending: true, connected: false });
+    }
+
+    if (connection === "close") {
+      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const loggedOut = statusCode === DisconnectReason.loggedOut;
+      entry.connected = false;
+      await setBotSession(userId, { connected: false, qr_pending: false });
+      sessions.delete(userId);
+      if (!loggedOut) {
+        console.log(`Sesión de ${userId} se cayó, reconectando...`);
+        startSession(userId).catch((err) => console.error(`Error reconectando ${userId}:`, err));
+      } else {
+        console.log(`Sesión de ${userId} cerró sesión (logged out). Borra su carpeta de auth para reconectar de cero.`);
+      }
+    } else if (connection === "open") {
+      entry.connected = true;
+      entry.qrDataUrl = null;
+      await setBotSession(userId, { connected: true, qr_pending: false, last_seen_at: new Date().toISOString() });
+      console.log(`✅ WhatsApp conectado para usuario ${userId}`);
+    }
+  });
+
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    console.log(`📩 messages.upsert recibido — type: ${type}, cantidad: ${messages.length}`);
+    if (type !== "notify") return;
+    for (const msg of messages) {
+      if (!msg.message || msg.key.fromMe) {
+        console.log(`⏭️  Ignorado (sin contenido o es propio) — jid: ${msg.key.remoteJid}`);
+        continue;
+      }
       const jid = msg.key.remoteJid;
       if (jid.endsWith("@g.us")) continue;
 
