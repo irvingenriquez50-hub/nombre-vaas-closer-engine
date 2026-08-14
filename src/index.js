@@ -31,8 +31,8 @@ app.post("/connect/:userId", async (req, res) => {
 });
 
 // Polled by the web app — ya no hay QR, solo indica si el canal está listo.
-app.get("/status/:userId", (req, res) => {
-  const info = getSessionInfo(req.params.userId);
+app.get("/status/:userId", async (req, res) => {
+  const info = await getSessionInfo(req.params.userId);
   res.json({ ok: true, ...info });
 });
 
@@ -52,7 +52,7 @@ app.post("/add-lead/:userId", async (req, res) => {
   const { phone, skipMessage1 } = req.body || {};
   if (!phone) return res.status(400).json({ ok: false, error: "Falta el campo 'phone'." });
 
-  const info = getSessionInfo(userId);
+  const info = await getSessionInfo(userId);
   if (!info.connected) {
     return res.status(409).json({ ok: false, error: "Este miembro no tiene WhatsApp conectado todavía." });
   }
