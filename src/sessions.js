@@ -1,170 +1,114 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys";
-import { Boom } from "@hapi/boom";
-import pino from "pino";
-import QRCode from "qrcode";
-import path from "path";
-import fs from "fs";
-import { handleInboundMessage, sweepTimers } from "./queue.js";
 import { setBotSession, findLeadByAnyDigits } from "./state.js";
+import { handleInboundMessage, sweepTimers } from "./queue.js";
+import { supabase } from "./supabase.js";
 
+const D360_BASE_URL = "https://waba-v2.360dialog.io";
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MINUTES || 30) * 60 * 1000;
 
-// userId -> { sock, qrDataUrl, connected }
-const sessions = new Map();
+// Cache en memoria de las API keys de 360dialog por usuario, para no consultar Supabase en cada mensaje.
+const apiKeyCache = new Map();
 
-function authDir(userId) {
-  return path.resolve("data", "auth", userId);
+async function getApiKeyForUser(userId) {
+  if (apiKeyCache.has(userId)) return apiKeyCache.get(userId);
+  const { data } = await supabase
+    .from("whatsapp_channels")
+    .select("d360_api_key")
+    .eq("user_id", userId)
+    .maybeSingle();
+  const key = data?.d360_api_key || null;
+  if (key) apiKeyCache.set(userId, key);
+  return key;
+}
+
+export function invalidateApiKeyCache(userId) {
+  apiKeyCache.delete(userId);
 }
 
 export function getSessionInfo(userId) {
-  const s = sessions.get(userId);
-  return { connected: !!s?.connected, qrDataUrl: s?.qrDataUrl || null };
+  const key = apiKeyCache.get(userId);
+  return { connected: !!key, qrDataUrl: null };
 }
 
 export async function startSession(userId) {
-  if (sessions.has(userId) && sessions.get(userId).connected) return getSessionInfo(userId);
-
-  fs.mkdirSync(authDir(userId), { recursive: true });
-  const { state, saveCreds } = await useMultiFileAuthState(authDir(userId));
-
-  const sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: "warn" }),
-    printQRInTerminal: false,
-  });
-
-  const entry = { sock, qrDataUrl: null, connected: false };
-  sessions.set(userId, entry);
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      entry.qrDataUrl = await QRCode.toDataURL(qr);
-      entry.connected = false;
-      await setBotSession(userId, { qr_pending: true, connected: false });
-    }
-
-    if (connection === "close") {
-      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
-      entry.connected = false;
-      await setBotSession(userId, { connected: false, qr_pending: false });
-      sessions.delete(userId);
-      if (!loggedOut) {
-        console.log(`Sesión de ${userId} se cayó, reconectando...`);
-        startSession(userId).catch((err) => console.error(`Error reconectando ${userId}:`, err));
-      } else {
-        console.log(`Sesión de ${userId} cerró sesión (logged out). Borra su carpeta de auth para reconectar de cero.`);
-      }
-    } else if (connection === "open") {
-      entry.connected = true;
-      entry.qrDataUrl = null;
-      await setBotSession(userId, { connected: true, qr_pending: false, last_seen_at: new Date().toISOString() });
-      console.log(`✅ WhatsApp conectado para usuario ${userId}`);
-    }
-  });
-
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    console.log(`📩 messages.upsert recibido — type: ${type}, cantidad: ${messages.length}`);
-    if (type !== "notify") return;
-    for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) {
-        console.log(`⏭️  Ignorado (sin contenido o es propio) — jid: ${msg.key.remoteJid}`);
-        continue;
-      }
-      const rawJid = msg.key.remoteJid;
-      if (rawJid.endsWith("@g.us")) continue;
-
-      console.log(`🔑 msg.key completo: ${JSON.stringify(msg.key)}`);
-
-      let jid = rawJid;
-      if (rawJid.endsWith("@lid")) {
-        if (msg.key.remoteJidAlt) {
-          jid = msg.key.remoteJidAlt;
-          console.log(`🔀 remoteJid era @lid, usando remoteJidAlt: ${jid}`);
-        } else if (msg.key.senderPn) {
-          jid = msg.key.senderPn;
-          console.log(`🔀 remoteJid era @lid, usando senderPn: ${jid}`);
-        } else {
-          const candidates = [msg.key.senderPn, msg.key.participant].filter(Boolean);
-          const matched = await findLeadByAnyDigits(userId, candidates);
-          if (matched) {
-            jid = matched.jid;
-            console.log(`🔀 @lid resuelto por número de teléfono → usando jid guardado: ${jid}`);
-          } else {
-            console.log(`⚠️  @lid sin remoteJidAlt/senderPn y sin match por número — se usa el @lid tal cual`);
-          }
-        }
-      }
-
-      const text =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        msg.message.imageMessage?.caption ||
-        "";
-      if (!text.trim()) {
-        console.log(`⏭️  Ignorado (sin texto) — jid: ${jid}`);
-        continue;
-      }
-
-      console.log(`✉️  Procesando mensaje de ${jid} (user ${userId}): "${text.trim()}"`);
-      try {
-        await handleInboundMessage(sock, userId, jid, text.trim());
-        console.log(`✅ handleInboundMessage terminó sin error para ${jid}`);
-      } catch (err) {
-        console.error(`❌ Error procesando mensaje de ${jid} (user ${userId}):`, err);
-      }
-    }
-  });
-
-  return getSessionInfo(userId);
+  const key = await getApiKeyForUser(userId);
+  const connected = !!key;
+  await setBotSession(userId, { connected, qr_pending: false });
+  return { connected, qrDataUrl: null };
 }
 
-/** Borra la sesión guardada de un usuario (por si quedó rota/desconectada por WhatsApp)
- * y arranca una completamente nueva, lista para un QR fresco. Self-service, sin consola. */
 export async function resetSession(userId) {
-  const entry = sessions.get(userId);
-  if (entry?.sock) {
-    try {
-      entry.sock.end(undefined);
-    } catch {}
-  }
-  sessions.delete(userId);
-
-  const dir = authDir(userId);
-  if (fs.existsSync(dir)) {
-    fs.rmSync(dir, { recursive: true, force: true });
-    console.log(`🗑️  Sesión de ${userId} borrada — arrancando de cero`);
-  }
-
-  await setBotSession(userId, { connected: false, qr_pending: false });
+  invalidateApiKeyCache(userId);
   return startSession(userId);
 }
 
-export function getSocketForUser(userId) {
-  return sessions.get(userId)?.sock || null;
+export async function sendMessage(userId, jid, text) {
+  const apiKey = await getApiKeyForUser(userId);
+  if (!apiKey) throw new Error(`No hay API key de 360dialog guardada para el usuario ${userId}`);
+
+  const to = jid.replace(/@.*/, "");
+
+  const res = await fetch(`${D360_BASE_URL}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "D360-API-KEY": apiKey,
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: text },
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Error enviando mensaje via 360dialog: ${res.status} ${errText}`);
+  }
+  return res.json();
 }
 
-/** Restart any sessions that already have saved credentials on disk (e.g. after a Railway restart). */
-export async function restoreExistingSessions() {
-  const base = path.resolve("data", "auth");
-  if (!fs.existsSync(base)) return;
-  const userIds = fs.readdirSync(base).filter((f) => fs.statSync(path.join(base, f)).isDirectory());
-  for (const userId of userIds) {
-    console.log(`Restaurando sesión guardada para ${userId}...`);
-    startSession(userId).catch((err) => console.error(`No se pudo restaurar sesión de ${userId}:`, err));
+export async function handleWebhookPayload(userId, payload) {
+  const entry = payload?.entry?.[0];
+  const changes = entry?.changes?.[0]?.value;
+  const messages = changes?.messages;
+  if (!messages || !messages.length) return;
+
+  for (const msg of messages) {
+    if (msg.type !== "text") {
+      console.log(`⏭️  Ignorado (tipo no soportado: ${msg.type}) — from: ${msg.from}`);
+      continue;
+    }
+
+    const jid = msg.from;
+    const text = msg.text?.body || "";
+    if (!text.trim()) continue;
+
+    console.log(`✉️  Procesando mensaje de ${jid} (user ${userId}): "${text.trim()}"`);
+    try {
+      const fakeSock = {
+        sendMessage: async (toJid, content) => sendMessage(userId, toJid, content.text),
+      };
+      await handleInboundMessage(fakeSock, userId, jid, text.trim());
+      console.log(`✅ handleInboundMessage terminó sin error para ${jid}`);
+    } catch (err) {
+      console.error(`❌ Error procesando mensaje de ${jid} (user ${userId}):`, err);
+    }
   }
 }
 
-/** Runs sweepTimers for every currently connected session, on an interval. */
+export async function restoreExistingSessions() {
+  console.log("Usando API oficial de WhatsApp — no hay sesiones locales que restaurar.");
+}
+
 export function startGlobalSweep() {
-  setInterval(() => {
-    for (const [userId, entry] of sessions.entries()) {
-      if (!entry.connected) continue;
-      sweepTimers(entry.sock, userId).catch((err) => console.error(`Error en sweepTimers de ${userId}:`, err));
+  setInterval(async () => {
+    const { data: channels } = await supabase.from("whatsapp_channels").select("user_id");
+    for (const { user_id } of channels || []) {
+      const fakeSock = {
+        sendMessage: async (toJid, content) => sendMessage(user_id, toJid, content.text),
+      };
+      sweepTimers(fakeSock, user_id).catch((err) => console.error(`Error en sweepTimers de ${user_id}:`, err));
     }
   }, CHECK_INTERVAL_MS);
 }
