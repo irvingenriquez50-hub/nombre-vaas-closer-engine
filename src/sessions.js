@@ -24,8 +24,8 @@ export function invalidateApiKeyCache(userId) {
   apiKeyCache.delete(userId);
 }
 
-export function getSessionInfo(userId) {
-  const key = apiKeyCache.get(userId);
+export async function getSessionInfo(userId) {
+  const key = await getApiKeyForUser(userId);
   return { connected: !!key, qrDataUrl: null };
 }
 
