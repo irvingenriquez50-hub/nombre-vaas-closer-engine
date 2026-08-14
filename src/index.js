@@ -1,7 +1,15 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { startSession, resetSession, getSessionInfo, getSocketForUser, restoreExistingSessions, startGlobalSweep } from "./sessions.js";
+import {
+  startSession,
+  resetSession,
+  getSessionInfo,
+  sendMessage,
+  handleWebhookPayload,
+  restoreExistingSessions,
+  startGlobalSweep,
+} from "./sessions.js";
 import { startProcessForNumber } from "./queue.js";
 
 const app = express();
@@ -10,7 +18,8 @@ app.use(express.json());
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Called when a member clicks "Conectar WhatsApp" — starts (or resumes) their session.
+// Called when a member clicks "Conectar WhatsApp" — con la API oficial, esto solo
+// confirma que su API key de 360dialog ya está guardada en Supabase.
 app.post("/connect/:userId", async (req, res) => {
   try {
     const info = await startSession(req.params.userId);
@@ -21,14 +30,13 @@ app.post("/connect/:userId", async (req, res) => {
   }
 });
 
-// Polled by the web app while waiting for the QR to be scanned.
+// Polled by the web app — ya no hay QR, solo indica si el canal está listo.
 app.get("/status/:userId", (req, res) => {
   const info = getSessionInfo(req.params.userId);
   res.json({ ok: true, ...info });
 });
 
-// Self-service: borra la sesión rota de un usuario y arranca una completamente nueva
-// (nuevo QR). Nadie necesita tocar la consola de Railway para reconectar a alguien.
+// Self-service: refresca la API key de un usuario desde Supabase (por si la actualizaron).
 app.post("/reset/:userId", async (req, res) => {
   try {
     const info = await resetSession(req.params.userId);
@@ -44,11 +52,17 @@ app.post("/add-lead/:userId", async (req, res) => {
   const { phone, skipMessage1 } = req.body || {};
   if (!phone) return res.status(400).json({ ok: false, error: "Falta el campo 'phone'." });
 
-  const sock = getSocketForUser(userId);
-  if (!sock) return res.status(409).json({ ok: false, error: "Este miembro no tiene WhatsApp conectado todavía." });
+  const info = getSessionInfo(userId);
+  if (!info.connected) {
+    return res.status(409).json({ ok: false, error: "Este miembro no tiene WhatsApp conectado todavía." });
+  }
+
+  const fakeSock = {
+    sendMessage: async (toJid, content) => sendMessage(userId, toJid, content.text),
+  };
 
   try {
-    const result = await startProcessForNumber(sock, userId, phone, { skipMessage1: !!skipMessage1 });
+    const result = await startProcessForNumber(fakeSock, userId, phone, { skipMessage1: !!skipMessage1 });
     if (result.duplicate) {
       return res.status(409).json({ ok: false, error: `Este número ya está en proceso (${result.lead.status}).`, lead: result.lead });
     }
@@ -56,6 +70,16 @@ app.post("/add-lead/:userId", async (req, res) => {
   } catch (err) {
     console.error("Error agregando lead:", err);
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// 360dialog llama aquí cuando llega un mensaje nuevo al número de este usuario.
+app.post("/webhook/:userId", async (req, res) => {
+  res.sendStatus(200); // confirmar recepción rápido, procesar después
+  try {
+    await handleWebhookPayload(req.params.userId, req.body);
+  } catch (err) {
+    console.error(`Error procesando webhook de ${req.params.userId}:`, err);
   }
 });
 
