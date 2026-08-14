@@ -32,7 +32,7 @@ export async function getLead(userId, jid) {
 
 export async function addLead(userId, phoneRaw) {
   const digits = phoneRaw.replace(/[^0-9]/g, "");
-  const jid = `${digits}@s.whatsapp.net`;
+  const jid = digits;
   const existing = await getLead(userId, jid);
   if (existing) return { lead: existing, duplicate: true };
 
