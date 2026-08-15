@@ -1,109 +1,210 @@
-import { supabase } from "./supabase.js";
+import {
+  addLead,
+  appendMessage,
+  getLead,
+  upsertLeadPatch,
+  listActiveLeads,
+  logClosedDeal,
+  getScript,
+  getPricingTiers,
+  getUserEmail,
+} from "./state.js";
+import { getNextMove } from "./negotiate.js";
 
-export async function getUserEmail(userId) {
-  const { data } = await supabase.from("users").select("email").eq("id", userId).maybeSingle();
-  return data?.email || null;
+const HOURS_MSG2 = Number(process.env.HOURS_BEFORE_MESSAGE_2 || 24);
+const HOURS_ACCEPT = Number(process.env.HOURS_BEFORE_ACCEPT_LAST_OFFER || 24);
+const SEND_WINDOW_START_HOUR_CT = Number(process.env.SEND_WINDOW_START_HOUR_CT ?? 22);
+const SEND_WINDOW_END_HOUR_CT = Number(process.env.SEND_WINDOW_END_HOUR_CT ?? 7);
+const DEBOUNCE_MS = Number(process.env.REPLY_DEBOUNCE_SECONDS || 30) * 1000;
+
+const hoursSince = (ts) => (ts ? (Date.now() - new Date(ts).getTime()) / 3600000 : Infinity);
+
+// In-memory per-lead debounce timers, keyed by `${userId}:${jid}` — holds inbound
+// messages that arrive close together so the bot answers once with full context
+// instead of replying to each message separately mid-thought.
+const pendingReplies = new Map();
+
+function withinSendWindow() {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    hour12: false,
+    weekday: "short",
+    timeZone: "America/Chicago",
+  }).formatToParts(new Date());
+  const ctHour = Number(parts.find((p) => p.type === "hour").value) % 24;
+  const ctWeekday = parts.find((p) => p.type === "weekday").value;
+
+  // TEMPORAL PARA PRUEBAS — bloqueo de fin de semana desactivado. Descomentar la línea de abajo cuando terminen las pruebas:
+  // if (ctWeekday === "Fri" || ctWeekday === "Sat") return false;
+  if (SEND_WINDOW_START_HOUR_CT === SEND_WINDOW_END_HOUR_CT) return true;
+  if (SEND_WINDOW_START_HOUR_CT < SEND_WINDOW_END_HOUR_CT) {
+    return ctHour >= SEND_WINDOW_START_HOUR_CT && ctHour < SEND_WINDOW_END_HOUR_CT;
+  }
+  return ctHour >= SEND_WINDOW_START_HOUR_CT || ctHour < SEND_WINDOW_END_HOUR_CT;
 }
 
-export async function findLeadByAnyDigits(userId, candidateIdentifiers) {
-  const digitsList = candidateIdentifiers
-    .filter(Boolean)
-    .map((j) => j.replace(/[^0-9]/g, ""))
-    .filter((d) => d.length >= 7);
-  if (!digitsList.length) return null;
+export async function startProcessForNumber(sock, userId, phoneRaw, { skipMessage1 = false } = {}) {
+  const { lead, duplicate } = await addLead(userId, phoneRaw);
+  if (duplicate) return { duplicate: true, lead };
 
-  const { data } = await supabase.from("leads").select("*").eq("user_id", userId).neq("status", "cerrado");
-  if (!data) return null;
+  if (skipMessage1) {
+    // El escrito 1 se manda a mano desde el teléfono real — el bot solo entra a
+    // negociar en cuanto la marca conteste, sin nunca mandar un mensaje en frío.
+    const updated = await upsertLeadPatch(userId, lead.jid, { status: "esperando" });
+    return { duplicate: false, lead: updated, waitingForWindow: false, manual: true };
+  }
 
-  for (const lead of data) {
-    const leadDigits = (lead.phone || "").replace(/[^0-9]/g, "");
-    if (!leadDigits) continue;
-    for (const d of digitsList) {
-      if (leadDigits.slice(-8) === d.slice(-8)) return lead;
+  if (!withinSendWindow()) return { duplicate: false, lead, waitingForWindow: true };
+
+  const script = await getScript(userId);
+  await sock.sendMessage(lead.jid, { text: script.message1 });
+  await appendMessage(userId, lead.jid, "assistant", script.message1);
+  const updated = await upsertLeadPatch(userId, lead.jid, {
+    status: "escrito_enviado",
+    last_outbound_at: new Date().toISOString(),
+  });
+  return { duplicate: false, lead: updated, waitingForWindow: false };
+}
+
+async function resolveAndSend(sock, userId, jid) {
+  const lead = await getLead(userId, jid);
+  if (!lead || lead.status === "cerrado" || lead.paused) {
+    console.log(`⚠️  resolveAndSend: no se contesta a ${jid} (status: ${lead?.status}, paused: ${lead?.paused})`);
+    return;
+  }
+
+  console.log(`🤖 Llamando a la IA para generar la respuesta a ${jid}...`);
+  const tiers = await getPricingTiers(userId);
+  const { replyText, closed, dormant, closedPrice, closedVideos } = await getNextMove(lead.conversation, tiers);
+  console.log(`🤖 IA respondió: "${replyText}" (closed: ${closed}, dormant: ${dormant})`);
+
+  await sock.sendMessage(jid, { text: replyText });
+  console.log(`📤 Mensaje enviado a ${jid}`);
+  await appendMessage(userId, jid, "assistant", replyText);
+
+  if (closed) {
+    await upsertLeadPatch(userId, jid, { status: "cerrado", last_outbound_at: new Date().toISOString() });
+    await logClosedDeal(userId, { jid, phone: lead.phone, price: closedPrice, videos: closedVideos });
+    await reportClosedDealToTracker(userId, { phone: lead.phone, price: closedPrice, videos: closedVideos, timezone: lead.timezone });
+  } else if (dormant) {
+    await upsertLeadPatch(userId, jid, { status: "dormant", last_outbound_at: new Date().toISOString() });
+  } else {
+    await upsertLeadPatch(userId, jid, { status: "negociando", last_outbound_at: new Date().toISOString() });
+  }
+}
+
+/** Called on every inbound WhatsApp message. Logs it immediately, then (re)starts a
+ * debounce timer — the bot only actually replies once N minutes pass with no new
+ * message, so a burst of texts gets answered together instead of one at a time. */
+export async function handleInboundMessage(sock, userId, jid, text) {
+  console.log(`🔍 handleInboundMessage: buscando lead para ${jid} (user ${userId})`);
+  const lead = await getLead(userId, jid);
+  if (!lead || lead.status === "cerrado") {
+    console.log(`⚠️  No hay lead activo para ${jid} (encontrado: ${!!lead}, status: ${lead?.status}) — ignorando`);
+    return;
+  }
+
+  await appendMessage(userId, jid, "user", text);
+  await upsertLeadPatch(userId, jid, { last_inbound_at: new Date().toISOString() });
+
+  if (lead.paused) {
+    console.log(`⏸️  Lead ${jid} está pausado — no se contesta`);
+    return;
+  }
+
+  const key = `${userId}:${jid}`;
+  if (pendingReplies.has(key)) {
+    console.log(`🔁 Ya había un timer para ${jid}, se reinicia`);
+    clearTimeout(pendingReplies.get(key));
+  }
+  console.log(`⏳ Timer de ${DEBOUNCE_MS / 1000}s iniciado para ${jid}`);
+  const timer = setTimeout(() => {
+    pendingReplies.delete(key);
+    console.log(`⏰ Timer cumplido para ${jid} — generando respuesta ahora`);
+    resolveAndSend(sock, userId, jid).catch((err) => console.error(`❌ Error respondiendo a ${jid} (user ${userId}):`, err));
+  }, DEBOUNCE_MS);
+  pendingReplies.set(key, timer);
+}
+
+async function reportClosedDealToTracker(userId, deal) {
+  const url = process.env.CLOSED_DEAL_WEBHOOK_URL;
+  const secret = process.env.CLOSED_DEAL_WEBHOOK_SECRET;
+  if (!url) return;
+  try {
+    const email = await getUserEmail(userId);
+    if (!email) {
+      console.error(`No se encontró el email del usuario ${userId} — no se pudo reportar el deal cerrado.`);
+      return;
+    }
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-webhook-secret": secret || "" },
+      body: JSON.stringify({ ...deal, email }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.error(`El Retainer Tracker respondió ${res.status} al reportar el deal: ${text}`);
+    } else {
+      console.log(`✅ Deal cerrado reportado al Retainer Tracker para ${email}`);
+    }
+  } catch (err) {
+    console.error("No se pudo mandar el deal cerrado al Retainer Tracker:", err.message);
+  }
+}
+
+export async function sweepTimers(sock, userId) {
+  if (!withinSendWindow()) return;
+
+  const active = await listActiveLeads(userId);
+  const script = await getScript(userId);
+
+  for (const lead of active) {
+    if (lead.status === "nuevo") {
+      await sock.sendMessage(lead.jid, { text: script.message1 });
+      await appendMessage(userId, lead.jid, "assistant", script.message1);
+      await upsertLeadPatch(userId, lead.jid, { status: "escrito_enviado", last_outbound_at: new Date().toISOString() });
+      continue;
+    }
+
+    if (lead.last_inbound_at && new Date(lead.last_inbound_at) > new Date(lead.last_outbound_at)) continue;
+
+    if (lead.status === "escrito_enviado" && hoursSince(lead.last_outbound_at) >= HOURS_MSG2) {
+      await sock.sendMessage(lead.jid, { text: script.message2 });
+      await appendMessage(userId, lead.jid, "assistant", script.message2);
+      await upsertLeadPatch(userId, lead.jid, { status: "esperando", last_outbound_at: new Date().toISOString() });
+      continue;
+    }
+
+    if ((lead.status === "esperando" || lead.status === "followup") && hoursSince(lead.last_outbound_at) >= 24) {
+      const followupText = "Hey, any updates?";
+      await sock.sendMessage(lead.jid, { text: followupText });
+      await appendMessage(userId, lead.jid, "assistant", followupText);
+      await upsertLeadPatch(userId, lead.jid, { status: "followup", last_outbound_at: new Date().toISOString() });
+      continue;
+    }
+
+    if (lead.status === "negociando" && hoursSince(lead.last_outbound_at) >= HOURS_ACCEPT) {
+      const tiers = await getPricingTiers(userId);
+      const nudged = [
+        ...lead.conversation,
+        {
+          role: "user",
+          content:
+            "[SYSTEM NOTE: 24 hours have passed with no reply. This is a special case — skip the normal two-step confirm process. Accept the brand's last stated offer now, even if it's below your floor, and close the deal immediately: send a short close-out line AND include the <<CLOSE:{...}>> tag in this same message, since no further reply is expected.]",
+        },
+      ];
+      const { replyText, closed, dormant, closedPrice, closedVideos } = await getNextMove(nudged, tiers);
+      await sock.sendMessage(lead.jid, { text: replyText });
+      await appendMessage(userId, lead.jid, "assistant", replyText);
+      if (closed) {
+        await upsertLeadPatch(userId, lead.jid, { status: "cerrado", last_outbound_at: new Date().toISOString() });
+        await logClosedDeal(userId, { jid: lead.jid, phone: lead.phone, price: closedPrice, videos: closedVideos });
+        await reportClosedDealToTracker(userId, { phone: lead.phone, price: closedPrice, videos: closedVideos, timezone: lead.timezone });
+      } else if (dormant) {
+        await upsertLeadPatch(userId, lead.jid, { status: "dormant", last_outbound_at: new Date().toISOString() });
+      } else {
+        await upsertLeadPatch(userId, lead.jid, { last_outbound_at: new Date().toISOString() });
+      }
     }
   }
-  return null;
-}
-
-export async function getLead(userId, jid) {
-  const { data } = await supabase.from("leads").select("*").eq("user_id", userId).eq("jid", jid).maybeSingle();
-  return data;
-}
-
-export async function addLead(userId, phoneRaw) {
-  const digits = phoneRaw.replace(/[^0-9]/g, "");
-  const jid = digits;
-  const existing = await getLead(userId, jid);
-  if (existing) return { lead: existing, duplicate: true };
-
-  const { data, error } = await supabase
-    .from("leads")
-    .insert({ user_id: userId, phone: phoneRaw.trim(), jid, status: "nuevo" })
-    .select()
-    .single();
-  if (error) throw error;
-  return { lead: data, duplicate: false };
-}
-
-export async function upsertLeadPatch(userId, jid, patch) {
-  const { data, error } = await supabase
-    .from("leads")
-    .update({ ...patch, updated_at: new Date().toISOString() })
-    .eq("user_id", userId)
-    .eq("jid", jid)
-    .select()
-    .single();
-  if (error) throw error;
-  return data;
-}
-
-export async function appendMessage(userId, jid, role, content) {
-  const lead = await getLead(userId, jid);
-  const conversation = [...(lead?.conversation || []), { role, content, ts: Date.now() }];
-  return upsertLeadPatch(userId, jid, { conversation });
-}
-
-export async function listActiveLeads(userId) {
-  const { data } = await supabase
-    .from("leads")
-    .select("*")
-    .eq("user_id", userId)
-    .neq("status", "cerrado")
-    .neq("status", "dormant")
-    .eq("paused", false);
-  return data || [];
-}
-
-export async function logClosedDeal(userId, deal) {
-  const { data: lead } = await supabase
-    .from("leads")
-    .select("id")
-    .eq("user_id", userId)
-    .eq("jid", deal.jid)
-    .maybeSingle();
-
-  await supabase.from("closed_deals").insert({
-    user_id: userId,
-    lead_id: lead?.id || null,
-    phone: deal.phone,
-    price: deal.price,
-    videos: deal.videos,
-  });
-}
-
-export async function getScript(userId) {
-  const { data } = await supabase.from("scripts").select("*").eq("user_id", userId).maybeSingle();
-  return {
-    message1: data?.message1 || "",
-    message2: data?.message2 || "Your number was recommended in the VAAS community for pay collab.",
-  };
-}
-
-export async function getPricingTiers(userId) {
-  const { data } = await supabase.from("pricing_tiers").select("videos,anchor,floor").eq("user_id", userId);
-  return data || [];
-}
-
-export async function setBotSession(userId, patch) {
-  await supabase.from("bot_sessions").upsert({ user_id: userId, ...patch });
 }
