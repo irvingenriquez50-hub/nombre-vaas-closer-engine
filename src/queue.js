@@ -4,10 +4,12 @@ import {
   getLead,
   upsertLeadPatch,
   listActiveLeads,
+  listDormantLeadsForFollowup,
   logClosedDeal,
   getScript,
   getPricingTiers,
   getUserEmail,
+  findCrossMemberLead,
 } from "./state.js";
 import { getNextMove } from "./negotiate.js";
 
@@ -44,8 +46,19 @@ function withinSendWindow() {
 }
 
 export async function startProcessForNumber(sock, userId, phoneRaw, { skipMessage1 = false } = {}) {
+  // Revisa PRIMERO si este número ya tiene historial con OTRO miembro de VAAS.
+  const cross = await findCrossMemberLead(phoneRaw, userId);
+
   const { lead, duplicate } = await addLead(userId, phoneRaw);
   if (duplicate) return { duplicate: true, lead };
+
+  if (cross) {
+    const updated = await upsertLeadPatch(userId, lead.jid, { status: "cruzado", paused: true });
+    console.log(
+      `🚨 COLABORACIÓN CRUZADA: ${phoneRaw} ya tiene historial con otro miembro (user_id: ${cross.user_id}, status: ${cross.status}). Lead pausado, NO se mandó ningún mensaje.`
+    );
+    return { duplicate: false, lead: updated, crossMember: true };
+  }
 
   if (skipMessage1) {
     // El escrito 1 se manda a mano desde el teléfono real — el bot solo entra a
@@ -206,5 +219,18 @@ export async function sweepTimers(sock, userId) {
         await upsertLeadPatch(userId, lead.jid, { last_outbound_at: new Date().toISOString() });
       }
     }
+  }
+
+  // Recordatorio automático de 30 días para leads "dormant" (sin presupuesto).
+  const dormantDue = await listDormantLeadsForFollowup(userId, 30);
+  for (const lead of dormantDue) {
+    const followupText = "Hey, just checking back in — let me know if a budget opens up for a collab down the line.";
+    await sock.sendMessage(lead.jid, { text: followupText });
+    await appendMessage(userId, lead.jid, "assistant", followupText);
+    await upsertLeadPatch(userId, lead.jid, {
+      dormant_followup_sent: true,
+      last_outbound_at: new Date().toISOString(),
+    });
+    console.log(`🔔 Follow-up de 30 días mandado a ${lead.jid} (user ${userId})`);
   }
 }
