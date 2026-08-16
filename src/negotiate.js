@@ -11,12 +11,6 @@ function extractDollarAmounts(text) {
   return matches.map((m) => Number(m.replace(/[$,\s]/g, ""))).filter((n) => !Number.isNaN(n));
 }
 
-/**
- * For each price tier, counts how many times the ASSISTANT has already stated a
- * number at or near that tier's mid price — this is the actual "hold round" count,
- * computed deterministically in code instead of asking the model to infer it by
- * re-reading the whole conversation each turn.
- */
 function computeMidHoldStatus(conversation, tiers) {
   return tiers
     .map((tier) => {
@@ -38,8 +32,6 @@ function computeMidHoldStatus(conversation, tiers) {
     .filter((s) => s.roundsHeld > 0);
 }
 
-/** Finds the most recent package size (video count) mentioned anywhere in the conversation,
- * so the final override reminder can call out the SPECIFIC number to hold, not just a table. */
 function guessActiveTier(conversation, tiers) {
   for (let i = conversation.length - 1; i >= 0; i--) {
     const match = (conversation[i].content || "").match(/(\d+)\s*videos?/i);
@@ -156,6 +148,21 @@ If the tier above shows the hold is NOT complete, you must NOT state a price bel
 `;
 }
 
+async function callModel(system, messages) {
+  const response = await anthropic.messages.create({
+    model: "claude-sonnet-5",
+    max_tokens: 300,
+    system,
+    messages,
+  });
+
+  return response.content
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
+
 /**
  * @param {Array<{role: 'user'|'assistant', content: string}>} conversation
  * @param {Array<{videos:number, anchor:number, medio?:number, floor:number}>} tiers
@@ -166,18 +173,23 @@ export async function getNextMove(conversation, tiers) {
   const system = baseSystem + finalReminder;
   const messages = conversation.map((m) => ({ role: m.role, content: m.content }));
 
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-5",
-    max_tokens: 300,
-    system,
-    messages,
-  });
+  let rawText = await callModel(system, messages);
 
-  const rawText = response.content
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("\n")
-    .trim();
+  if (!rawText) {
+    console.warn("⚠️  La IA devolvió una respuesta vacía, reintentando una vez...");
+    rawText = await callModel(system, messages);
+  }
+
+  if (!rawText) {
+    console.error("⚠️  La IA volvió a devolver vacío en el reintento — usando respuesta de respaldo para no romper la conversación.");
+    return {
+      replyText: "Sorry, could you repeat that?",
+      closed: false,
+      dormant: false,
+      closedPrice: null,
+      closedVideos: null,
+    };
+  }
 
   const closeMatch = rawText.match(CLOSE_TAG_REGEX);
   if (closeMatch) {
