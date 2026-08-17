@@ -5,11 +5,6 @@ export async function getUserEmail(userId) {
   return data?.email || null;
 }
 
-export async function getUserInfo(userId) {
-  const { data } = await supabase.from("users").select("name,email").eq("id", userId).maybeSingle();
-  return { name: data?.name || "un miembro", email: data?.email || "sin correo" };
-}
-
 export async function findLeadByAnyDigits(userId, candidateIdentifiers) {
   const digitsList = candidateIdentifiers
     .filter(Boolean)
@@ -26,24 +21,6 @@ export async function findLeadByAnyDigits(userId, candidateIdentifiers) {
     for (const d of digitsList) {
       if (leadDigits.slice(-8) === d.slice(-8)) return lead;
     }
-  }
-  return null;
-}
-
-// Busca si un número ya tiene historial con OTRO miembro (colaboración cruzada).
-export async function findCrossMemberLead(phoneRaw, excludeUserId) {
-  const digits = (phoneRaw || "").replace(/[^0-9]/g, "");
-  if (digits.length < 7) return null;
-
-  const { data } = await supabase
-    .from("leads")
-    .select("id,user_id,phone,status")
-    .neq("user_id", excludeUserId);
-  if (!data) return null;
-
-  for (const lead of data) {
-    const leadDigits = (lead.phone || "").replace(/[^0-9]/g, "");
-    if (leadDigits && digits.slice(-8) === leadDigits.slice(-8)) return lead;
   }
   return null;
 }
@@ -93,22 +70,7 @@ export async function listActiveLeads(userId) {
     .eq("user_id", userId)
     .neq("status", "cerrado")
     .neq("status", "dormant")
-    .neq("status", "cruzado")
     .eq("paused", false);
-  return data || [];
-}
-
-// Leads "dormant" (sin presupuesto) que ya llevan 30+ días sin recontactar
-// y todavía no recibieron su follow-up automático.
-export async function listDormantLeadsForFollowup(userId, days = 30) {
-  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-  const { data } = await supabase
-    .from("leads")
-    .select("*")
-    .eq("user_id", userId)
-    .eq("status", "dormant")
-    .eq("dormant_followup_sent", false)
-    .lte("last_outbound_at", cutoff);
   return data || [];
 }
 
@@ -134,11 +96,16 @@ export async function getScript(userId) {
   return {
     message1: data?.message1 || "",
     message2: data?.message2 || "Your number was recommended in the VAAS community for pay collab.",
+    gmvTotal: data?.gmv_total || "",
+    market: data?.market || "Spanish-speaking",
+    shortName: data?.short_name || "",
+    gmv30d: data?.gmv_30d || "",
+    tiktokHandle: data?.tiktok_handle || "",
   };
 }
 
 export async function getPricingTiers(userId) {
-  const { data } = await supabase.from("pricing_tiers").select("videos,anchor,medio,floor").eq("user_id", userId);
+  const { data } = await supabase.from("pricing_tiers").select("videos,anchor,floor").eq("user_id", userId);
   return data || [];
 }
 
