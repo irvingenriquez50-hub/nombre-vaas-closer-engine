@@ -4,14 +4,13 @@ import {
   getLead,
   upsertLeadPatch,
   listActiveLeads,
-  listDormantLeadsForFollowup,
   logClosedDeal,
   getScript,
   getPricingTiers,
   getUserEmail,
-  findCrossMemberLead,
 } from "./state.js";
 import { getNextMove } from "./negotiate.js";
+import { sendOpeningTemplate } from "./sessions.js";
 
 const HOURS_MSG2 = Number(process.env.HOURS_BEFORE_MESSAGE_2 || 24);
 const HOURS_ACCEPT = Number(process.env.HOURS_BEFORE_ACCEPT_LAST_OFFER || 24);
@@ -21,9 +20,6 @@ const DEBOUNCE_MS = Number(process.env.REPLY_DEBOUNCE_SECONDS || 30) * 1000;
 
 const hoursSince = (ts) => (ts ? (Date.now() - new Date(ts).getTime()) / 3600000 : Infinity);
 
-// In-memory per-lead debounce timers, keyed by `${userId}:${jid}` — holds inbound
-// messages that arrive close together so the bot answers once with full context
-// instead of replying to each message separately mid-thought.
 const pendingReplies = new Map();
 
 function withinSendWindow() {
@@ -36,8 +32,7 @@ function withinSendWindow() {
   const ctHour = Number(parts.find((p) => p.type === "hour").value) % 24;
   const ctWeekday = parts.find((p) => p.type === "weekday").value;
 
-  // TEMPORAL PARA PRUEBAS — bloqueo de fin de semana desactivado. Descomentar la línea de abajo cuando terminen las pruebas:
-  // if (ctWeekday === "Fri" || ctWeekday === "Sat") return false;
+  // if (ctWeekday === "Fri" || ctWeekday === "Sat") return false; // DESACTIVADO TEMPORAL PARA PRUEBAS — reactivar cuando terminemos
   if (SEND_WINDOW_START_HOUR_CT === SEND_WINDOW_END_HOUR_CT) return true;
   if (SEND_WINDOW_START_HOUR_CT < SEND_WINDOW_END_HOUR_CT) {
     return ctHour >= SEND_WINDOW_START_HOUR_CT && ctHour < SEND_WINDOW_END_HOUR_CT;
@@ -45,33 +40,42 @@ function withinSendWindow() {
   return ctHour >= SEND_WINDOW_START_HOUR_CT || ctHour < SEND_WINDOW_END_HOUR_CT;
 }
 
-export async function startProcessForNumber(sock, userId, phoneRaw, { skipMessage1 = false } = {}) {
-  // Revisa PRIMERO si este número ya tiene historial con OTRO miembro de VAAS.
-  const cross = await findCrossMemberLead(phoneRaw, userId);
+/** Arma las 8 variables del template de apertura, en el mismo orden que {{1}} a {{8}}
+ * en el template aprobado por Meta, jalando los precios de 1/5/10 videos de la
+ * tabla de precios del usuario. */
+async function buildOpeningTemplateParams(userId) {
+  const script = await getScript(userId);
+  const tiers = await getPricingTiers(userId);
+  const tier1 = tiers.find((t) => t.videos === 1);
+  const tier5 = tiers.find((t) => t.videos === 5);
+  const tier10 = tiers.find((t) => t.videos === 10);
 
+  return [
+    script.gmvTotal || "0",
+    script.market || "Spanish-speaking",
+    script.shortName || "",
+    String(tier1?.anchor ?? ""),
+    String(tier5?.anchor ?? ""),
+    String(tier10?.anchor ?? ""),
+    script.gmv30d || "0",
+    script.tiktokHandle || "",
+  ];
+}
+
+export async function startProcessForNumber(sock, userId, phoneRaw, { skipMessage1 = false } = {}) {
   const { lead, duplicate } = await addLead(userId, phoneRaw);
   if (duplicate) return { duplicate: true, lead };
 
-  if (cross) {
-    const updated = await upsertLeadPatch(userId, lead.jid, { status: "cruzado", paused: true });
-    console.log(
-      `🚨 COLABORACIÓN CRUZADA: ${phoneRaw} ya tiene historial con otro miembro (user_id: ${cross.user_id}, status: ${cross.status}). Lead pausado, NO se mandó ningún mensaje.`
-    );
-    return { duplicate: false, lead: updated, crossMember: true };
-  }
-
   if (skipMessage1) {
-    // El escrito 1 se manda a mano desde el teléfono real — el bot solo entra a
-    // negociar en cuanto la marca conteste, sin nunca mandar un mensaje en frío.
     const updated = await upsertLeadPatch(userId, lead.jid, { status: "esperando" });
     return { duplicate: false, lead: updated, waitingForWindow: false, manual: true };
   }
 
   if (!withinSendWindow()) return { duplicate: false, lead, waitingForWindow: true };
 
-  const script = await getScript(userId);
-  await sock.sendMessage(lead.jid, { text: script.message1 });
-  await appendMessage(userId, lead.jid, "assistant", script.message1);
+  const params = await buildOpeningTemplateParams(userId);
+  await sendOpeningTemplate(userId, lead.jid, params);
+  await appendMessage(userId, lead.jid, "assistant", "[Opening template message sent]");
   const updated = await upsertLeadPatch(userId, lead.jid, {
     status: "escrito_enviado",
     last_outbound_at: new Date().toISOString(),
@@ -106,9 +110,6 @@ async function resolveAndSend(sock, userId, jid) {
   }
 }
 
-/** Called on every inbound WhatsApp message. Logs it immediately, then (re)starts a
- * debounce timer — the bot only actually replies once N minutes pass with no new
- * message, so a burst of texts gets answered together instead of one at a time. */
 export async function handleInboundMessage(sock, userId, jid, text) {
   console.log(`🔍 handleInboundMessage: buscando lead para ${jid} (user ${userId})`);
   const lead = await getLead(userId, jid);
@@ -173,8 +174,9 @@ export async function sweepTimers(sock, userId) {
 
   for (const lead of active) {
     if (lead.status === "nuevo") {
-      await sock.sendMessage(lead.jid, { text: script.message1 });
-      await appendMessage(userId, lead.jid, "assistant", script.message1);
+      const params = await buildOpeningTemplateParams(userId);
+      await sendOpeningTemplate(userId, lead.jid, params);
+      await appendMessage(userId, lead.jid, "assistant", "[Opening template message sent]");
       await upsertLeadPatch(userId, lead.jid, { status: "escrito_enviado", last_outbound_at: new Date().toISOString() });
       continue;
     }
@@ -219,18 +221,5 @@ export async function sweepTimers(sock, userId) {
         await upsertLeadPatch(userId, lead.jid, { last_outbound_at: new Date().toISOString() });
       }
     }
-  }
-
-  // Recordatorio automático de 30 días para leads "dormant" (sin presupuesto).
-  const dormantDue = await listDormantLeadsForFollowup(userId, 30);
-  for (const lead of dormantDue) {
-    const followupText = "Hey, just checking back in — let me know if a budget opens up for a collab down the line.";
-    await sock.sendMessage(lead.jid, { text: followupText });
-    await appendMessage(userId, lead.jid, "assistant", followupText);
-    await upsertLeadPatch(userId, lead.jid, {
-      dormant_followup_sent: true,
-      last_outbound_at: new Date().toISOString(),
-    });
-    console.log(`🔔 Follow-up de 30 días mandado a ${lead.jid} (user ${userId})`);
   }
 }
