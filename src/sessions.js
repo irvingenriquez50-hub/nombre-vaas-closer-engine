@@ -4,8 +4,9 @@ import { supabase } from "./supabase.js";
 
 const D360_BASE_URL = "https://waba-v2.360dialog.io";
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MINUTES || 30) * 60 * 1000;
+const OPENING_TEMPLATE_NAME = "vaas_opening_message";
+const OPENING_TEMPLATE_LANGUAGE = "en";
 
-// Cache en memoria de las API keys de 360dialog por usuario, para no consultar Supabase en cada mensaje.
 const apiKeyCache = new Map();
 
 async function getApiKeyForUser(userId) {
@@ -64,6 +65,45 @@ export async function sendMessage(userId, jid, text) {
   if (!res.ok) {
     const errText = await res.text();
     throw new Error(`Error enviando mensaje via 360dialog: ${res.status} ${errText}`);
+  }
+  return res.json();
+}
+
+/** Manda el mensaje 1 (mensaje de apertura en frío) usando el formato de template
+ * de Meta — obligatorio para cualquier mensaje que abre una conversación nueva,
+ * aunque el texto final sea idéntico al de un mensaje de texto normal. */
+export async function sendOpeningTemplate(userId, jid, bodyParams) {
+  const apiKey = await getApiKeyForUser(userId);
+  if (!apiKey) throw new Error(`No hay API key de 360dialog guardada para el usuario ${userId}`);
+
+  const to = jid.replace(/@.*/, "");
+
+  const res = await fetch(`${D360_BASE_URL}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "D360-API-KEY": apiKey,
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "template",
+      template: {
+        name: OPENING_TEMPLATE_NAME,
+        language: { code: OPENING_TEMPLATE_LANGUAGE },
+        components: [
+          {
+            type: "body",
+            parameters: bodyParams.map((text) => ({ type: "text", text: String(text) })),
+          },
+        ],
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Error enviando template de apertura via 360dialog: ${res.status} ${errText}`);
   }
   return res.json();
 }
