@@ -77,6 +77,7 @@ STYLE RULES (strict):
 - NEVER phrase anything as a question or request permission, except the clarifying questions explicitly allowed below. Banned patterns: "Can we...", "Would you...", "Do you think...", "Does that work?". Everything else is a flat statement. Instead of "Can we meet in the middle at $X?" say "Let's meet in the middle at $X for [n] videos."
 - Never apologize for your price.
 - IF THE BRAND ASKS how you got their number, who you are, where the contact came from, or anything similar ("how did you get my number?", "who gave you this?", "who are you?") — answer simply: "You were recommended in the VAAS community for a paid collab." Do not elaborate further or invent extra detail. If they specifically ask whether you know a named person (e.g. "do you know Ruben?"), confirm plainly and credit them: "Yes, [name] recommended you in the VAAS community." Keep this reply short, on its own, and don't let it derail the pricing conversation — after answering, you can still steer back to videos/price in the same message if it fits naturally.
+- COMMISSION IS OFF-LIMITS — NEVER MENTION IT. If the brand offers, mentions, or negotiates a commission/affiliate percentage alongside a video price (e.g. "$1150 for 5 videos plus 30% commission"), completely ignore the commission part in your reply — do not accept it, reject it, thank them for it, or say anything like "don't worry about the commission," "no need for commission," or any phrase suggesting you don't want it or don't care about it. Never use the word "commission" in your own messages at all. Respond only about the video price/count, exactly as you would if they had only mentioned a price with no commission attached — e.g. if they say "$1150 and 30% commission" and $1150 is below your mid, push back on the $1150 the same way you normally would, without referencing the commission in any way.
 - Blunt is fine, even a little curt — you don't need to soften rejections with extra politeness. "That is too low for me" said flatly is on-brand, not rude.
 - If the brand seems confused about whether you accepted their offer (e.g. "so you'll do it?", "does that work?") when you have NOT actually agreed to a price at/above your floor, do not confirm or use the close template — just restate your firm position in plain terms so there's no ambiguity.
 - CLARIFYING QUESTIONS (the only questions you're allowed to ask): if the brand's message doesn't clearly state both the number of videos AND a price, ask directly: "So what's the deal? How many videos you want and what's the rates?" — or, if they've asked you to send the product / more info without confirming terms, ask: "How many videos are we making, and are you able to match my rates?" This also applies when the brand objects to price without giving any actual counter-number ("that's too high for us," "too expensive," similar vague pushback with no number attached) — don't guess a step-down price with nothing to work against; ask for their budget/rate directly instead.
@@ -157,6 +158,24 @@ If the tier above shows the hold is NOT complete, you must NOT state a price bel
 `;
 }
 
+function getMidForTier(tier) {
+  return tier.medio ?? Math.round((tier.anchor + tier.floor) / 2);
+}
+
+function findHoldRounds(holdStatus, tier) {
+  const s = holdStatus.find((x) => x.videos === tier.videos);
+  return s ? s.roundsHeld : 0;
+}
+
+/** Checks whether a drafted reply states a number meaningfully BELOW the tier's mid
+ * price, which is not allowed until 2 hold rounds are complete. */
+function replyViolatesMidHold(replyText, mid) {
+  const band = Math.max(25, Math.round(mid * 0.05));
+  const amounts = extractDollarAmounts(replyText);
+  if (!amounts.length) return false;
+  return Math.min(...amounts) < mid - band;
+}
+
 async function callModel(system, messages) {
   const response = await anthropic.messages.create({
     model: "claude-sonnet-5",
@@ -198,6 +217,29 @@ export async function getNextMove(conversation, tiers) {
       closedPrice: null,
       closedVideos: null,
     };
+  }
+
+  // ENFORCEMENT LAYER: don't just trust the model to obey the mid-hold rule — verify it
+  // in code against the real message history, and force a correction if it skipped ahead.
+  const isCloseOrDormant = CLOSE_TAG_REGEX.test(rawText) || DORMANT_TAG_REGEX.test(rawText);
+  if (!isCloseOrDormant) {
+    const holdStatusBefore = computeMidHoldStatus(conversation, tiers);
+    const activeTier = guessActiveTier(conversation, tiers);
+    if (activeTier) {
+      const roundsHeld = findHoldRounds(holdStatusBefore, activeTier);
+      const mid = getMidForTier(activeTier);
+      if (roundsHeld < 2 && replyViolatesMidHold(rawText, mid)) {
+        console.warn(`⚠️  La IA se saltó el hold del precio medio ($${mid} para ${activeTier.videos} videos, llevaba ${roundsHeld}/2 rondas) — forzando corrección.`);
+        const correctionSystem =
+          system +
+          `\n\n=== CORRECTION REQUIRED ===\nYour previous draft reply stated a number below $${mid} for the ${activeTier.videos}-video package, but you have only completed ${roundsHeld} of the required 2 hold rounds at mid. That draft is REJECTED — discard it completely. Write a brand-new reply that holds at or above $${mid} instead, with a brief reason attached. Do not state any number below $${mid} anywhere in this new reply.`;
+        rawText = await callModel(correctionSystem, messages);
+        if (replyViolatesMidHold(rawText, mid)) {
+          console.warn(`⚠️  La corrección también falló — usando mensaje de respaldo fijo para el hold en $${mid}.`);
+          rawText = `Honestly, $${mid} is already a strong number for ${activeTier.videos} videos given the results I bring — that's where I can land for this.`;
+        }
+      }
+    }
   }
 
   const closeMatch = rawText.match(CLOSE_TAG_REGEX);
