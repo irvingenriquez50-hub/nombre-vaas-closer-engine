@@ -81,7 +81,13 @@ export async function startProcessForNumber(sock, userId, phoneRaw, { skipMessag
 
   if (skipMessage1) {
     console.log(`✍️  skipMessage1 activado para ${phoneRaw} — se deja en "esperando", sin mandar template.`);
-    const updated = await upsertLeadPatch(userId, lead.jid, { status: "esperando" });
+    // Se guarda la fecha de AHORA como si fuera el envío, porque Irving acaba de
+    // mandar el mensaje a mano. Sin esto, el sistema creería que pasó una eternidad
+    // desde el último mensaje y dispararía los 4 follow-ups uno tras otro.
+    const updated = await upsertLeadPatch(userId, lead.jid, {
+      status: "esperando",
+      last_outbound_at: new Date().toISOString(),
+    });
     return { duplicate: false, lead: updated, waitingForWindow: false, manual: true };
   }
 
@@ -233,6 +239,15 @@ export async function sweepTimers(sock, userId) {
       (lead.status === "escrito_enviado" || lead.status === "esperando" || lead.status === "followup") &&
       hoursSince(lead.last_outbound_at) >= 24
     ) {
+      // Contactos viejos que quedaron sin fecha guardada: se les pone la de ahora y
+      // se dejan para el próximo día. Sin esto, "sin fecha" cuenta como infinito y
+      // les dispararía los 4 follow-ups seguidos en un par de horas.
+      if (!lead.last_outbound_at) {
+        console.log(`🕒 ${lead.jid} no tenía fecha de último envío — se le pone la de ahora y su follow-up arranca mañana.`);
+        await upsertLeadPatch(userId, lead.jid, { last_outbound_at: new Date().toISOString() });
+        continue;
+      }
+
       const sent = Number(lead.followup_count || 0);
 
       // Tope de 4 follow-ups (4 días). Después se deja en paz: pasa a "dormant",
