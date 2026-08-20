@@ -23,11 +23,29 @@ const SEND_WINDOW_START_HOUR_CT = Number(process.env.SEND_WINDOW_START_HOUR_CT ?
 const SEND_WINDOW_END_HOUR_CT = Number(process.env.SEND_WINDOW_END_HOUR_CT ?? 7);
 const DEBOUNCE_MS = Number(process.env.REPLY_DEBOUNCE_SECONDS || 300) * 1000;
 
+// ═══ MODO PRUEBAS — SOLO para la cuenta admin de Irving ═══
+// Se identifica por user_id EXACTO (único e irrepetible en Supabase), nunca por
+// correo ni por nada que se pueda confundir — así es imposible que otra cuenta
+// herede estas reglas por accidente. Para esta cuenta y SOLO esta:
+//   - contesta a los 45 segundos (en vez de 5 minutos)
+//   - manda a cualquier hora y cualquier día (sin ventana 10pm-7am ni bloqueo Vie/Sáb)
+// Todas las demás cuentas siguen el reglamento normal de producción.
+const TEST_MODE_USER_IDS = (process.env.TEST_MODE_USER_IDS || "d5c3e03b-5ac0-45d9-9852-b3cc9abe95b3")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const TEST_DEBOUNCE_MS = Number(process.env.TEST_REPLY_DEBOUNCE_SECONDS || 45) * 1000;
+
+const isTestUser = (userId) => TEST_MODE_USER_IDS.includes(userId);
+const debounceMsFor = (userId) => (isTestUser(userId) ? TEST_DEBOUNCE_MS : DEBOUNCE_MS);
+
 const hoursSince = (ts) => (ts ? (Date.now() - new Date(ts).getTime()) / 3600000 : Infinity);
 
 const pendingReplies = new Map();
 
-function withinSendWindow() {
+function withinSendWindow(userId) {
+  // La cuenta de pruebas de Irving no tiene horario ni días bloqueados.
+  if (userId && isTestUser(userId)) return true;
   const parts = new Intl.DateTimeFormat("en-US", {
     hour: "numeric",
     hour12: false,
@@ -91,7 +109,7 @@ export async function startProcessForNumber(sock, userId, phoneRaw, { skipMessag
     return { duplicate: false, lead: updated, waitingForWindow: false, manual: true };
   }
 
-  if (!withinSendWindow()) {
+  if (!withinSendWindow(userId)) {
     console.log(`🌙 Fuera de la ventana de envío ahorita mismo — ${phoneRaw} queda en "nuevo", se manda en el próximo sweep.`);
     return { duplicate: false, lead, waitingForWindow: true };
   }
@@ -182,12 +200,13 @@ export async function handleInboundMessage(sock, userId, jid, text) {
     console.log(`🔁 Ya había un timer para ${resolvedJid}, se reinicia`);
     clearTimeout(pendingReplies.get(key));
   }
-  console.log(`⏳ Timer de ${DEBOUNCE_MS / 1000}s iniciado para ${resolvedJid}`);
+  const debounceMs = debounceMsFor(userId);
+  console.log(`⏳ Timer de ${debounceMs / 1000}s iniciado para ${resolvedJid}${isTestUser(userId) ? " (cuenta de pruebas)" : ""}`);
   const timer = setTimeout(() => {
     pendingReplies.delete(key);
     console.log(`⏰ Timer cumplido para ${resolvedJid} — generando respuesta ahora`);
     resolveAndSend(sock, userId, resolvedJid).catch((err) => console.error(`❌ Error respondiendo a ${resolvedJid} (user ${userId}):`, err));
-  }, DEBOUNCE_MS);
+  }, debounceMs);
   pendingReplies.set(key, timer);
 }
 
@@ -218,7 +237,7 @@ async function reportClosedDealToTracker(userId, deal) {
 }
 
 export async function sweepTimers(sock, userId) {
-  if (!withinSendWindow()) return;
+  if (!withinSendWindow(userId)) return;
 
   const active = await listActiveLeads(userId);
 
