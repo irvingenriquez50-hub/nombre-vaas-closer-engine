@@ -273,6 +273,33 @@ export async function sweepTimers(sock, userId) {
 
     // Pasaron 24h sin respuesta en una negociación activa: se acepta su última
     // oferta y se cierra. forceAccept lo maneja directo el decisor de negotiate.js.
+    // "Esperando al equipo": ellos dijeron "déjame checar / te aviso". Cada 2 horas
+    // se les pregunta "Hey, any updates?" (texto libre, dentro de su ventana de 24h),
+    // máximo 4 veces. Si su ventana ya está por cerrar, se deja de intentar.
+    if (lead.status === "negociando" && lead.negotiation?.waiting === true) {
+      const nudges = Number(lead.negotiation.waitingNudges || 0);
+      const hoursSinceTheirs = hoursSince(lead.last_inbound_at);
+      if (
+        nudges < 4 &&
+        hoursSince(lead.last_outbound_at) >= 2 &&
+        hoursSinceTheirs < 23
+      ) {
+        const nudgeText = "Hey, any updates?";
+        try {
+          await sock.sendMessage(lead.jid, { text: nudgeText });
+          await appendMessage(userId, lead.jid, "assistant", nudgeText);
+          await upsertLeadPatch(userId, lead.jid, {
+            negotiation: { ...lead.negotiation, waitingNudges: nudges + 1 },
+            last_outbound_at: new Date().toISOString(),
+          });
+          console.log(`⏲️  Nudge ${nudges + 1}/4 ("any updates?") a ${lead.jid} — esperando a su equipo.`);
+        } catch (err) {
+          console.error(`❌ No se pudo mandar el nudge a ${lead.jid}: ${err.message}`);
+        }
+      }
+      continue; // mientras esperan a su equipo, NO aplica el cierre automático de 18h
+    }
+
     if (lead.status === "negociando" && hoursSince(lead.last_outbound_at) >= HOURS_ACCEPT) {
       // La ventana de 24h de WhatsApp se cuenta desde el ÚLTIMO mensaje que ELLOS
       // mandaron. Si ya se pasó, el texto libre va a fallar sí o sí ([131047]), así
