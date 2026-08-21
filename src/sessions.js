@@ -11,16 +11,40 @@ const FOLLOWUP_TEMPLATE_LANGUAGE = "en";
 
 const apiKeyCache = new Map();
 
-async function getApiKeyForUser(userId) {
+async function getChannelForUser(userId) {
   if (apiKeyCache.has(userId)) return apiKeyCache.get(userId);
   const { data } = await supabase
     .from("whatsapp_channels")
-    .select("d360_api_key")
+    .select("d360_api_key,phone_number")
     .eq("user_id", userId)
     .maybeSingle();
-  const key = data?.d360_api_key || null;
-  if (key) apiKeyCache.set(userId, key);
-  return key;
+  const channel = data?.d360_api_key ? { apiKey: data.d360_api_key, phone: data.phone_number || "?" } : null;
+
+  if (channel) {
+    // GUARDIA ANTI-CRUCE: si esta misma API key está guardada también en OTRA
+    // cuenta, los mensajes de una van a salir del número de la otra (fue el bug
+    // del mensaje que salió del número de Armando). Se avisa fuerte en los logs
+    // para corregir la key en Admin de inmediato.
+    const { data: dupes } = await supabase
+      .from("whatsapp_channels")
+      .select("user_id,phone_number")
+      .eq("d360_api_key", channel.apiKey)
+      .neq("user_id", userId);
+    if (dupes && dupes.length) {
+      console.error(
+        `🚨 ALERTA DE CRUCE: la API key del usuario ${userId} es IDÉNTICA a la de otra(s) cuenta(s): ${dupes
+          .map((d) => `${d.user_id} (número ${d.phone_number || "?"})`)
+          .join(", ")}. Los mensajes van a salir del número equivocado — corrige la API key en Admin.`
+      );
+    }
+    apiKeyCache.set(userId, channel);
+  }
+  return channel;
+}
+
+async function getApiKeyForUser(userId) {
+  const channel = await getChannelForUser(userId);
+  return channel?.apiKey || null;
 }
 
 export function invalidateApiKeyCache(userId) {
@@ -45,10 +69,12 @@ export async function resetSession(userId) {
 }
 
 export async function sendMessage(userId, jid, text) {
-  const apiKey = await getApiKeyForUser(userId);
-  if (!apiKey) throw new Error(`No hay API key de 360dialog guardada para el usuario ${userId}`);
+  const channel = await getChannelForUser(userId);
+  if (!channel) throw new Error(`No hay API key de 360dialog guardada para el usuario ${userId}`);
+  const apiKey = channel.apiKey;
 
   const to = jid.replace(/@.*/, "");
+  console.log(`📱 Enviando DESDE el número ${channel.phone} (user ${userId}) HACIA ${to}`);
 
   const res = await fetch(`${D360_BASE_URL}/messages`, {
     method: "POST",
@@ -75,11 +101,12 @@ export async function sendMessage(userId, jid, text) {
  * de Meta — obligatorio para cualquier mensaje que abre una conversación nueva,
  * aunque el texto final sea idéntico al de un mensaje de texto normal. */
 export async function sendOpeningTemplate(userId, jid, bodyParams) {
-  const apiKey = await getApiKeyForUser(userId);
-  if (!apiKey) throw new Error(`No hay API key de 360dialog guardada para el usuario ${userId}`);
+  const channel = await getChannelForUser(userId);
+  if (!channel) throw new Error(`No hay API key de 360dialog guardada para el usuario ${userId}`);
+  const apiKey = channel.apiKey;
 
   const to = jid.replace(/@.*/, "");
-  console.log(`📨 Mandando template de apertura a ${to} (user ${userId}) con params: ${JSON.stringify(bodyParams)}`);
+  console.log(`📨 Mandando template de apertura DESDE ${channel.phone} (user ${userId}) HACIA ${to} con params: ${JSON.stringify(bodyParams)}`);
 
   const res = await fetch(`${D360_BASE_URL}/messages`, {
     method: "POST",
@@ -118,11 +145,12 @@ export async function sendOpeningTemplate(userId, jid, bodyParams) {
  * (justo se manda porque la marca NO ha contestado), y ahí el texto libre falla
  * con el error [131047]. El template no tiene variables. */
 export async function sendFollowupTemplate(userId, jid) {
-  const apiKey = await getApiKeyForUser(userId);
-  if (!apiKey) throw new Error(`No hay API key de 360dialog guardada para el usuario ${userId}`);
+  const channel = await getChannelForUser(userId);
+  if (!channel) throw new Error(`No hay API key de 360dialog guardada para el usuario ${userId}`);
+  const apiKey = channel.apiKey;
 
   const to = jid.replace(/@.*/, "");
-  console.log(`📨 Mandando template de follow-up a ${to} (user ${userId})`);
+  console.log(`📨 Mandando template de follow-up DESDE ${channel.phone} (user ${userId}) HACIA ${to}`);
 
   const res = await fetch(`${D360_BASE_URL}/messages`, {
     method: "POST",

@@ -19,8 +19,8 @@ import { sendOpeningTemplate, sendFollowupTemplate } from "./sessions.js";
 // mensaje sale como texto normal, sin necesidad de template. Si se dejara en 24h,
 // caería justo en el límite (o fuera) y fallaría con el error [131047].
 const HOURS_ACCEPT = Number(process.env.HOURS_BEFORE_ACCEPT_LAST_OFFER || 18);
-const SEND_WINDOW_START_HOUR_CT = Number(process.env.SEND_WINDOW_START_HOUR_CT ?? 22);
-const SEND_WINDOW_END_HOUR_CT = Number(process.env.SEND_WINDOW_END_HOUR_CT ?? 7);
+const SEND_WINDOW_START_HOUR_CT = Number(process.env.SEND_WINDOW_START_HOUR_CT ?? 20);
+const SEND_WINDOW_END_HOUR_CT = Number(process.env.SEND_WINDOW_END_HOUR_CT ?? 8);
 const DEBOUNCE_MS = Number(process.env.REPLY_DEBOUNCE_SECONDS || 300) * 1000;
 
 // ═══ MODO PRUEBAS — SOLO para la cuenta admin de Irving ═══
@@ -237,12 +237,19 @@ async function reportClosedDealToTracker(userId, deal) {
 }
 
 export async function sweepTimers(sock, userId) {
-  if (!withinSendWindow(userId)) return;
+  // El horario de envío (8pm–8am CT, dom–jue) aplica SOLO a lo que el bot inicia
+  // en frío: mensaje 1 y follow-ups. Las piezas urgentes de conversaciones VIVAS
+  // (el cierre a 18h y los nudges de "any updates?" mientras su equipo revisa) NO
+  // esperan al horario: si la marca escribió a la 1pm hora de Texas, es porque
+  // opera en horario de EE.UU. — su ventana de 24h corre, y esperar hasta las 8pm
+  // puede matar el cierre. Cada bloque abajo decide si respeta la ventana o no.
+  const coldSendsAllowed = withinSendWindow(userId);
 
   const active = await listActiveLeads(userId);
 
   for (const lead of active) {
     if (lead.status === "nuevo") {
+      if (!coldSendsAllowed) continue;
       const params = await buildOpeningTemplateParams(userId);
       await sendOpeningTemplate(userId, lead.jid, params);
       await appendMessage(userId, lead.jid, "assistant", "[Opening template message sent]");
@@ -254,9 +261,15 @@ export async function sweepTimers(sock, userId) {
 
     // Ya no se manda el "message2" — después del mensaje 1, a las 24h arrancan
     // directo los follow-ups de "Hey, any updates?" (máximo 4).
+    // El follow-up espera 25 horas (no 24) A PROPÓSITO: así cada mensaje cae una
+    // hora MÁS TARDE que el anterior. Si el mensaje 1 salió a las 8pm, el follow-up
+    // 1 cae a las 9pm del día siguiente, el 2 a las 10pm, el 3 a las 11pm, el 4 a
+    // las 12am — se va recorriendo el horario para atinarle a la hora en que la
+    // marca sí está viendo el teléfono, en vez de llegar siempre a la misma hora.
     if (
+      coldSendsAllowed &&
       (lead.status === "escrito_enviado" || lead.status === "esperando" || lead.status === "followup") &&
-      hoursSince(lead.last_outbound_at) >= 24
+      hoursSince(lead.last_outbound_at) >= 25
     ) {
       // Contactos viejos que quedaron sin fecha guardada: se les pone la de ahora y
       // se dejan para el próximo día. Sin esto, "sin fecha" cuenta como infinito y
