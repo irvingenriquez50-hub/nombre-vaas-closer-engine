@@ -36,7 +36,10 @@ const TEST_MODE_USER_IDS = (process.env.TEST_MODE_USER_IDS || "d5c3e03b-5ac0-45d
   .filter(Boolean);
 const TEST_DEBOUNCE_MS = Number(process.env.TEST_REPLY_DEBOUNCE_SECONDS || 45) * 1000;
 
-const isTestUser = (userId) => TEST_MODE_USER_IDS.includes(userId);
+// Si la variable trae "ALL" (o "*"), TODAS las cuentas quedan en modo pruebas:
+// sin horario, sin días bloqueados y con timer corto. Para pruebas masivas.
+const TEST_MODE_ALL = TEST_MODE_USER_IDS.some((s) => s.toUpperCase() === "ALL" || s === "*");
+const isTestUser = (userId) => TEST_MODE_ALL || TEST_MODE_USER_IDS.includes(userId);
 const debounceMsFor = (userId) => (isTestUser(userId) ? TEST_DEBOUNCE_MS : DEBOUNCE_MS);
 
 const hoursSince = (ts) => (ts ? (Date.now() - new Date(ts).getTime()) / 3600000 : Infinity);
