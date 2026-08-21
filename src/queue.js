@@ -46,20 +46,32 @@ const pendingReplies = new Map();
 function withinSendWindow(userId) {
   // La cuenta de pruebas de Irving no tiene horario ni días bloqueados.
   if (userId && isTestUser(userId)) return true;
-  const parts = new Intl.DateTimeFormat("en-US", {
-    hour: "numeric",
-    hour12: false,
-    weekday: "short",
-    timeZone: "America/Chicago",
-  }).formatToParts(new Date());
+  const now = new Date();
+  const fmt = (d) =>
+    new Intl.DateTimeFormat("en-US", {
+      hour: "numeric",
+      hour12: false,
+      weekday: "short",
+      timeZone: "America/Chicago",
+    }).formatToParts(d);
+  const parts = fmt(now);
   const ctHour = Number(parts.find((p) => p.type === "hour").value) % 24;
-  const ctWeekday = parts.find((p) => p.type === "weekday").value;
 
-  // Solo se MANDAN mensajes de domingo a jueves (hora de Texas). Viernes y sábado
-  // no se inicia nada. Ojo: esto NO bloquea las respuestas — si una marca contesta
-  // un viernes o sábado, el bot le sigue contestando normal (resolveAndSend no pasa
-  // por aquí). Esto solo frena los envíos que arranca el bot por su cuenta.
-  if (ctWeekday === "Fri" || ctWeekday === "Sat") return false;
+  // El día NO se evalúa por el calendario sino por la NOCHE a la que pertenece
+  // este momento. La madrugada (antes de la hora de cierre) pertenece a la noche
+  // que empezó AYER a las 8pm. Ejemplo: viernes 4am de Texas = noche del jueves
+  // = viernes de día en China (día laboral) → SÍ se manda.
+  const isMadrugada = ctHour < SEND_WINDOW_END_HOUR_CT;
+  const dayParts = isMadrugada ? fmt(new Date(now.getTime() - 24 * 3600000)) : parts;
+  const nightDay = dayParts.find((p) => p.type === "weekday").value;
+
+  // Noches bloqueadas: la del viernes y la del sábado (hora de Texas), porque
+  // caen en sábado y domingo de China. Quedan activas las noches de domingo a
+  // jueves = lunes a viernes laborales en China. Ojo: esto NO bloquea las
+  // respuestas — si una marca contesta, el bot le sigue contestando normal a
+  // cualquier hora (resolveAndSend no pasa por aquí). Esto solo frena los
+  // envíos que arranca el bot por su cuenta.
+  if (nightDay === "Fri" || nightDay === "Sat") return false;
   if (SEND_WINDOW_START_HOUR_CT === SEND_WINDOW_END_HOUR_CT) return true;
   if (SEND_WINDOW_START_HOUR_CT < SEND_WINDOW_END_HOUR_CT) {
     return ctHour >= SEND_WINDOW_START_HOUR_CT && ctHour < SEND_WINDOW_END_HOUR_CT;
