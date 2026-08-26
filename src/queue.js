@@ -5,6 +5,7 @@ import {
   findLeadByAnyDigits,
   upsertLeadPatch,
   listActiveLeads,
+  listDormantForRetry,
   logClosedDeal,
   getScript,
   getPricingTiers,
@@ -44,6 +45,16 @@ const MAX_WAITING_NUDGES = Number(process.env.MAX_WAITING_NUDGES || 3);
 // 7 días, máximo 4 veces (un mes). Si en ese mes no sale nada, ahí sí se duerme.
 const CHECKBACK_DAYS = Number(process.env.CHECKBACK_DAYS || 7);
 const MAX_CHECKBACKS = Number(process.env.MAX_CHECKBACKS || 4);
+
+// ═══ REINTENTO A LOS 30 DÍAS ═══
+// A los contactos que nunca contestaron nada se les da UNA segunda vuelta un mes
+// después: se les manda el escrito otra vez y arranca el ciclo normal de 4
+// follow-ups. Solo una vez por contacto — queda registrado en la columna
+// dormant_followup_sent para que nunca se convierta en un ciclo sin fin.
+// El tope por barrido evita que, si un día se juntan cientos de dormidos, salgan
+// todos de golpe y Meta marque el número como spam.
+const DORMANT_RETRY_DAYS = Number(process.env.DORMANT_RETRY_DAYS || 30);
+const MAX_DORMANT_RETRIES_PER_SWEEP = Number(process.env.MAX_DORMANT_RETRIES_PER_SWEEP || 3);
 
 // ═══ MODO PRUEBAS — SOLO para la cuenta admin de Irving ═══
 // Se identifica por user_id EXACTO (único e irrepetible en Supabase), nunca por
@@ -284,6 +295,65 @@ async function reportClosedDealToTracker(userId, deal) {
     }
   } catch (err) {
     console.error("No se pudo mandar el deal cerrado al Retainer Tracker:", err.message);
+  }
+}
+
+/**
+ * Reintento de los 30 días.
+ *
+ * SEGURIDAD — solo despierta a quien NUNCA contestó nada. A "dormant" también
+ * llegan los que dijeron "no me interesa" o "ya me atiende otra persona", y a
+ * esos NO se les vuelve a escribir jamás: se les marca dormant_followup_sent
+ * para que no se vuelvan a evaluar y ahí se quedan.
+ */
+async function retryDormantLeads(userId, coldSendsAllowed) {
+  if (!coldSendsAllowed) return;
+
+  let dormidos = [];
+  try {
+    dormidos = await listDormantForRetry(userId);
+  } catch (err) {
+    console.error(`❌ No se pudo leer la lista de dormidos: ${err.message}`);
+    return;
+  }
+  if (!dormidos.length) return;
+
+  let enviados = 0;
+  for (const lead of dormidos) {
+    if (enviados >= MAX_DORMANT_RETRIES_PER_SWEEP) {
+      console.log(`⏸️  Tope de ${MAX_DORMANT_RETRIES_PER_SWEEP} reintentos por barrido alcanzado — los demás dormidos siguen en la fila.`);
+      break;
+    }
+    try {
+      if (hoursSince(lead.last_outbound_at) < DORMANT_RETRY_DAYS * 24) continue; // todavía no cumple el mes
+
+      const contestaron = Array.isArray(lead.conversation) && lead.conversation.some((m) => m.role === "user");
+      if (contestaron) {
+        await upsertLeadPatch(userId, lead.jid, { dormant_followup_sent: true });
+        console.log(`🚫 ${lead.jid} sí llegó a contestar en su momento — NO se reintenta. Se queda dormido para siempre.`);
+        continue;
+      }
+
+      const params = await buildOpeningTemplateParams(userId);
+      await sendOpeningTemplate(userId, lead.jid, params);
+      await appendMessage(userId, lead.jid, "assistant", "[Opening template message sent]");
+      await upsertLeadPatch(userId, lead.jid, {
+        status: "escrito_enviado",
+        followup_count: 0,
+        dormant_followup_sent: true,
+        negotiation: null,
+        last_error: null,
+        last_outbound_at: new Date().toISOString(),
+      });
+      enviados += 1;
+      console.log(`🌅 REINTENTO 30 DÍAS: ${lead.jid} despertó — se le mandó el escrito otra vez y arranca su ciclo de follow-ups. Es su única segunda vuelta.`);
+    } catch (err) {
+      // Se marca igual para que un número muerto no se reintente en cada barrido.
+      console.error(`❌ No se pudo despertar a ${lead.jid}: ${err.message} — se marca para no reintentarlo.`);
+      try {
+        await upsertLeadPatch(userId, lead.jid, { dormant_followup_sent: true, last_error: err.message });
+      } catch { /* ya quedó en los logs */ }
+    }
   }
 }
 
@@ -571,4 +641,7 @@ export async function sweepTimers(sock, userId) {
       } catch { /* si ni eso se puede guardar, al menos ya quedó en los logs */ }
    }
   }
+
+  // Los dormidos van aparte porque listActiveLeads no los incluye a propósito.
+  await retryDormantLeads(userId, coldSendsAllowed);
 }

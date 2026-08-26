@@ -75,6 +75,25 @@ export async function listActiveLeads(userId) {
   return data || [];
 }
 
+/** Contactos DORMIDOS que califican para el reintento de los 30 días.
+ *
+ * Solo se traen los que todavía no han tenido su segunda vuelta
+ * (dormant_followup_sent). Quién de estos se despierta de verdad se decide
+ * después en queue.js, que revisa que la marca NUNCA haya contestado nada —
+ * a alguien que ya dijo que no, no se le vuelve a escribir jamás.
+ *
+ * Se incluyen los que tienen la columna en null (contactos viejos, de antes de
+ * que esta regla existiera). */
+export async function listDormantForRetry(userId) {
+  const { data } = await supabase
+    .from("leads")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("status", "dormant")
+    .eq("paused", false);
+  return (data || []).filter((l) => !l.dormant_followup_sent);
+}
+
 /** Marca un lead como "fallido" cuando 360dialog/Meta reporta que la entrega del
  * mensaje falló (via el webhook de estados), guardando el motivo exacto para que
  * se pueda ver y reintentar desde la pestaña "Fallidos" del panel. Solo se marca

@@ -1108,9 +1108,25 @@ export default function DashboardClient({ targetUserId, isAdminView, profile, in
                       🔁 Seguimiento semanal {Number(lead.negotiation?.checkbackCount || 0)}/4 — dijeron que ahorita no hay nada pero que te avisan. El bot les pregunta cada 7 días.
                     </div>
                   ) : isDormant ? (
-                    <div className="mt-2 px-2.5 py-1.5 rounded-lg text-[11px]" style={{ background: "#1B2430", color: "#8B96A5" }}>
-                      😴 Nunca contestó después de los follow-ups — el bot lo dejó descansar.
-                    </div>
+                    (() => {
+                      // A los 30 días el bot le da UNA segunda vuelta, pero solo a
+                      // quien nunca contestó nada. Si la marca llegó a escribir
+                      // (aunque haya sido un "no"), ya no se le vuelve a escribir.
+                      const contestaron = (lead.conversation || []).some((m) => m.role === "user");
+                      const yaTuvoSegunda = !!lead.dormant_followup_sent;
+                      const base = lead.last_outbound_at ? new Date(lead.last_outbound_at).getTime() : null;
+                      const faltan = base ? Math.max(0, 30 - Math.floor((Date.now() - base) / 86400000)) : null;
+                      const revive = !contestaron && !yaTuvoSegunda;
+                      return (
+                        <div className="mt-2 px-2.5 py-1.5 rounded-lg text-[11px]" style={{ background: "#1B2430", color: revive ? "#8AB4F8" : "#8B96A5" }}>
+                          {revive
+                            ? `😴 Nunca contestó — el bot le manda el escrito otra vez ${faltan === 0 ? "en el próximo envío" : `en ${faltan} día${faltan === 1 ? "" : "s"}`}. Es su única segunda vuelta.`
+                            : contestaron
+                            ? "😴 Aquí sí hubo respuesta en su momento — el bot ya no le vuelve a escribir solo."
+                            : "😴 Ya tuvo su segunda vuelta a los 30 días — el bot ya no le escribe más."}
+                        </div>
+                      );
+                    })()
                   ) : (
                     <>
                       <div className="mt-3 flex items-center">
