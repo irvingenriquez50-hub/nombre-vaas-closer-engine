@@ -23,6 +23,14 @@ const SEND_WINDOW_START_HOUR_CT = Number(process.env.SEND_WINDOW_START_HOUR_CT ?
 const SEND_WINDOW_END_HOUR_CT = Number(process.env.SEND_WINDOW_END_HOUR_CT ?? 8);
 const DEBOUNCE_MS = Number(process.env.REPLY_DEBOUNCE_SECONDS || 300) * 1000;
 
+// ═══ RED DE SEGURIDAD PARA RESPUESTAS PERDIDAS ═══
+// El temporizador que contesta a la marca vive en la MEMORIA del servidor. Si
+// Railway se reinicia (deploy, caída, actualización automática) durante esos
+// minutos de espera, el temporizador desaparece y ese mensaje se queda SIN
+// CONTESTAR PARA SIEMPRE. Estas dos constantes controlan el rescate.
+const RESCUE_AFTER_MINUTES = Number(process.env.RESCUE_REPLY_AFTER_MINUTES || 15);
+const MAX_RESCUE_TRIES = Number(process.env.MAX_RESCUE_TRIES || 3);
+
 // ═══ MODO PRUEBAS — SOLO para la cuenta admin de Irving ═══
 // Se identifica por user_id EXACTO (único e irrepetible en Supabase), nunca por
 // correo ni por nada que se pueda confundir — así es imposible que otra cuenta
@@ -43,6 +51,7 @@ const isTestUser = (userId) => TEST_MODE_ALL || TEST_MODE_USER_IDS.includes(user
 const debounceMsFor = (userId) => (isTestUser(userId) ? TEST_DEBOUNCE_MS : DEBOUNCE_MS);
 
 const hoursSince = (ts) => (ts ? (Date.now() - new Date(ts).getTime()) / 3600000 : Infinity);
+const minutesSince = (ts) => (ts ? (Date.now() - new Date(ts).getTime()) / 60000 : Infinity);
 
 const pendingReplies = new Map();
 
@@ -169,14 +178,18 @@ async function resolveAndSend(sock, userId, jid) {
   console.log(`📤 Mensaje enviado a ${jid}`);
   await appendMessage(userId, jid, "assistant", replyText);
 
+  // El mensaje SÍ salió, así que el contador de rescates se pone en cero: este
+  // lead ya está sano otra vez.
+  const negOk = { ...(negotiation || {}), rescueTries: 0, rescueGaveUp: false };
+
   if (closed) {
-    await upsertLeadPatch(userId, jid, { status: "cerrado", negotiation, last_outbound_at: new Date().toISOString() });
+    await upsertLeadPatch(userId, jid, { status: "cerrado", negotiation: negOk, last_outbound_at: new Date().toISOString() });
     await logClosedDeal(userId, { jid, phone: lead.phone, price: closedPrice, videos: closedVideos });
     await reportClosedDealToTracker(userId, { phone: lead.phone, price: closedPrice, videos: closedVideos, timezone: lead.timezone });
   } else if (dormant) {
-    await upsertLeadPatch(userId, jid, { status: "dormant", negotiation, last_outbound_at: new Date().toISOString() });
+    await upsertLeadPatch(userId, jid, { status: "dormant", negotiation: negOk, last_outbound_at: new Date().toISOString() });
   } else {
-    await upsertLeadPatch(userId, jid, { status: "negociando", negotiation, last_outbound_at: new Date().toISOString() });
+    await upsertLeadPatch(userId, jid, { status: "negociando", negotiation: negOk, last_outbound_at: new Date().toISOString() });
   }
 }
 
@@ -272,7 +285,58 @@ export async function sweepTimers(sock, userId) {
       continue;
     }
 
-    if (lead.last_inbound_at && new Date(lead.last_inbound_at) > new Date(lead.last_outbound_at)) continue;
+    // ══════════ RED DE SEGURIDAD — RESPUESTAS QUE SE QUEDARON MUDAS ══════════
+    // Antes, esta parte era una sola línea: "si la marca escribió al último, sáltalo".
+    // El problema es que el ÚNICO que contesta a la marca es un temporizador que
+    // vive en la memoria del servidor. Si Railway se reinicia durante esos minutos
+    // de espera, el temporizador se pierde... y como este barrido se saltaba el
+    // lead, nadie volvía a mirarlo NUNCA. El lead quedaba muerto en silencio, sin
+    // aviso de ningún tipo. Eso es lo que se arregla aquí.
+    const theyWroteLast =
+      lead.last_inbound_at && (!lead.last_outbound_at || new Date(lead.last_inbound_at) > new Date(lead.last_outbound_at));
+
+    if (theyWroteLast) {
+      const waitingMin = minutesSince(lead.last_inbound_at);
+      const timerAlive = pendingReplies.has(`${userId}:${lead.jid}`);
+
+      // Caso normal: el temporizador sigue vivo, o todavía no pasa el tiempo de
+      // espera. No hay nada que rescatar — se deja trabajar en paz.
+      if (timerAlive || waitingMin < RESCUE_AFTER_MINUTES) continue;
+
+      const neg = lead.negotiation || {};
+      const tries = Number(neg.rescueTries || 0);
+      if (tries >= MAX_RESCUE_TRIES) continue; // ya se intentó suficiente, no insistir más
+
+      // Fuera de la ventana de 24h de WhatsApp no se puede mandar texto libre:
+      // el envío fallaría con [131047]. Se marca el lead con el motivo y se deja
+      // para revisión a mano. El aviso se escribe UNA sola vez, no en cada barrido.
+      const horas = hoursSince(lead.last_inbound_at);
+      if (horas >= 23.5) {
+        if (!neg.rescueGaveUp) {
+          console.error(
+            `🔇 ${lead.jid}: la marca escribió hace ${Math.round(horas)}h y el bot NUNCA contestó. La ventana de 24h ya cerró — REVÍSALO A MANO.`
+          );
+          await upsertLeadPatch(userId, lead.jid, {
+            negotiation: { ...neg, rescueGaveUp: true },
+            last_error: "El bot no alcanzó a contestar este mensaje y la ventana de 24h ya cerró. Contéstalo a mano.",
+          });
+        }
+        continue;
+      }
+
+      console.warn(
+        `🛟 RESCATE: ${lead.jid} lleva ${Math.round(waitingMin)} min esperando respuesta y su temporizador ya no existe — se contesta ahora (intento ${tries + 1}/${MAX_RESCUE_TRIES}).`
+      );
+      // El contador se sube ANTES de intentar, para que si algo truena a media
+      // operación el sistema no se quede reintentando lo mismo para siempre.
+      await upsertLeadPatch(userId, lead.jid, { negotiation: { ...neg, rescueTries: tries + 1 } });
+      try {
+        await resolveAndSend(sock, userId, lead.jid);
+      } catch (err) {
+        console.error(`❌ El rescate de ${lead.jid} falló: ${err.message}`);
+      }
+      continue;
+    }
 
     // Ya no se manda el "message2" — después del mensaje 1, a las 24h arrancan
     // directo los follow-ups de "Hey, any updates?" (máximo 4).
