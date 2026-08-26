@@ -299,12 +299,25 @@ export async function sweepTimers(sock, userId) {
   const active = await listActiveLeads(userId);
 
   for (const lead of active) {
+   // CADA CONTACTO VA AISLADO. Antes, si a UNO le tronaba el envío (número
+   // inválido, Meta lo rechaza, se cae la red), el error reventaba el ciclo
+   // completo y TODOS los contactos que venían después se saltaban sin aviso.
+   // Si el número malo estaba al principio, los demás no se procesaban NUNCA.
+   try {
     if (lead.status === "nuevo") {
       if (!coldSendsAllowed) continue;
-      const params = await buildOpeningTemplateParams(userId);
-      await sendOpeningTemplate(userId, lead.jid, params);
-      await appendMessage(userId, lead.jid, "assistant", "[Opening template message sent]");
-      await upsertLeadPatch(userId, lead.jid, { status: "escrito_enviado", last_outbound_at: new Date().toISOString() });
+      try {
+        const params = await buildOpeningTemplateParams(userId);
+        await sendOpeningTemplate(userId, lead.jid, params);
+        await appendMessage(userId, lead.jid, "assistant", "[Opening template message sent]");
+        await upsertLeadPatch(userId, lead.jid, { status: "escrito_enviado", last_outbound_at: new Date().toISOString() });
+      } catch (err) {
+        // No se pudo entregar el mensaje 1. Se marca como fallido con el motivo
+        // en vez de dejarlo en "nuevo" reintentando en cada barrido para siempre.
+        // Sale en rojo en la Cola, con su botón de Reiniciar.
+        console.error(`❌ No se pudo mandar el mensaje 1 a ${lead.jid}: ${err.message} — se marca como fallido.`);
+        await upsertLeadPatch(userId, lead.jid, { status: "fallido", last_error: err.message });
+      }
       continue;
     }
 
@@ -389,7 +402,13 @@ export async function sweepTimers(sock, userId) {
         });
         console.log(`🔁 Seguimiento semanal ${done + 1}/${MAX_CHECKBACKS} mandado a ${lead.jid}.`);
       } catch (err) {
-        console.error(`❌ No se pudo mandar el seguimiento semanal a ${lead.jid}: ${err.message}`);
+        // El intento se cuenta aunque haya fallado, para no reintentar sin parar.
+        console.error(`❌ No se pudo mandar el seguimiento semanal a ${lead.jid}: ${err.message} — el intento se cuenta igual.`);
+        await upsertLeadPatch(userId, lead.jid, {
+          negotiation: { ...neg, checkbackCount: done + 1 },
+          last_outbound_at: new Date().toISOString(),
+          last_error: err.message,
+        });
       }
       continue;
     }
@@ -427,14 +446,26 @@ export async function sweepTimers(sock, userId) {
       }
 
       const followupText = "Hey, any updates?";
-      await sendFollowupTemplate(userId, lead.jid);
-      await appendMessage(userId, lead.jid, "assistant", followupText);
-      await upsertLeadPatch(userId, lead.jid, {
-        status: "followup",
-        followup_count: sent + 1,
-        last_outbound_at: new Date().toISOString(),
-      });
-      console.log(`🔔 Follow-up ${sent + 1}/4 mandado a ${lead.jid}`);
+      try {
+        await sendFollowupTemplate(userId, lead.jid);
+        await appendMessage(userId, lead.jid, "assistant", followupText);
+        await upsertLeadPatch(userId, lead.jid, {
+          status: "followup",
+          followup_count: sent + 1,
+          last_outbound_at: new Date().toISOString(),
+        });
+        console.log(`🔔 Follow-up ${sent + 1}/4 mandado a ${lead.jid}`);
+      } catch (err) {
+        // El intento se cuenta AUNQUE haya fallado. Sin esto, un número muerto se
+        // reintentaría en cada barrido para siempre, quemando llamadas a Meta.
+        console.error(`❌ No se pudo mandar el follow-up ${sent + 1}/4 a ${lead.jid}: ${err.message} — el intento se cuenta igual.`);
+        await upsertLeadPatch(userId, lead.jid, {
+          status: "followup",
+          followup_count: sent + 1,
+          last_outbound_at: new Date().toISOString(),
+          last_error: err.message,
+        });
+      }
       continue;
     }
 
@@ -473,7 +504,13 @@ export async function sweepTimers(sock, userId) {
           });
           console.log(`⏲️  Día ${nudges + 1}/${MAX_WAITING_NUDGES} preguntando "any updates?" a ${lead.jid} — está confirmando con la marca${insideWindow ? "" : " (por template)"}.`);
         } catch (err) {
-          console.error(`❌ No se pudo mandar el recordatorio a ${lead.jid}: ${err.message}`);
+          // El intento se cuenta aunque haya fallado, para no reintentar sin parar.
+          console.error(`❌ No se pudo mandar el recordatorio a ${lead.jid}: ${err.message} — el intento se cuenta igual.`);
+          await upsertLeadPatch(userId, lead.jid, {
+            negotiation: { ...lead.negotiation, waitingNudges: nudges + 1 },
+            last_outbound_at: new Date().toISOString(),
+            last_error: err.message,
+          });
         }
       }
       continue; // mientras confirman con la marca, NO aplica el cierre automático de 18h
@@ -527,5 +564,11 @@ export async function sweepTimers(sock, userId) {
         await upsertLeadPatch(userId, lead.jid, { negotiation, last_outbound_at: new Date().toISOString() });
       }
     }
+   } catch (err) {
+      console.error(`❌ Falló el barrido de ${lead.jid}: ${err.message} — se sigue con los demás contactos.`);
+      try {
+        await upsertLeadPatch(userId, lead.jid, { last_error: `Error del sistema: ${err.message}` });
+      } catch { /* si ni eso se puede guardar, al menos ya quedó en los logs */ }
+   }
   }
 }
