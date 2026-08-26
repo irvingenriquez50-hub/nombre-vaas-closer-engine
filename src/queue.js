@@ -31,6 +31,20 @@ const DEBOUNCE_MS = Number(process.env.REPLY_DEBOUNCE_SECONDS || 300) * 1000;
 const RESCUE_AFTER_MINUTES = Number(process.env.RESCUE_REPLY_AFTER_MINUTES || 15);
 const MAX_RESCUE_TRIES = Number(process.env.MAX_RESCUE_TRIES || 3);
 
+// ═══ "DÉJAME CONFIRMAR CON LA MARCA" ═══
+// Muchos de estos contactos son intermediarios: ya que acuerdan un precio, todavía
+// tienen que aprobarlo con la marca, y eso tarda de UNO A DOS DÍAS. Antes se les
+// preguntaba cada 2 horas, lo cual es encimoso y quema el contacto. Ahora se les
+// pregunta una vez al día, máximo 3 días.
+const WAITING_NUDGE_HOURS = Number(process.env.WAITING_NUDGE_HOURS || 24);
+const MAX_WAITING_NUDGES = Number(process.env.MAX_WAITING_NUDGES || 3);
+
+// ═══ "AHORITA NO HAY NADA, PERO TE AVISO" ═══
+// La puerta quedó abierta, así que el contacto NO se muere: se le pregunta cada
+// 7 días, máximo 4 veces (un mes). Si en ese mes no sale nada, ahí sí se duerme.
+const CHECKBACK_DAYS = Number(process.env.CHECKBACK_DAYS || 7);
+const MAX_CHECKBACKS = Number(process.env.MAX_CHECKBACKS || 4);
+
 // ═══ MODO PRUEBAS — SOLO para la cuenta admin de Irving ═══
 // Se identifica por user_id EXACTO (único e irrepetible en Supabase), nunca por
 // correo ni por nada que se pueda confundir — así es imposible que otra cuenta
@@ -159,12 +173,12 @@ async function resolveAndSend(sock, userId, jid) {
 
   console.log(`🤖 Llamando a la IA para generar la respuesta a ${jid}...`);
   const tiers = await getPricingTiers(userId);
-  const { replyText, noAction, closed, dormant, closedPrice, closedVideos, negotiation } = await getNextMove(
+  const { replyText, noAction, closed, dormant, checkBack, closedPrice, closedVideos, negotiation } = await getNextMove(
     lead.conversation,
     tiers,
     lead.negotiation || null
   );
-  console.log(`🤖 Respuesta final: "${replyText}" (closed: ${closed}, dormant: ${dormant})`);
+  console.log(`🤖 Respuesta final: "${replyText}" (closed: ${closed}, dormant: ${dormant}, checkBack: ${!!checkBack})`);
 
   if (noAction || !replyText) {
     console.warn(`⏹️  ${jid}: no hay nada que contestar — no se manda ni se cierra nada.`);
@@ -188,6 +202,15 @@ async function resolveAndSend(sock, userId, jid) {
     await reportClosedDealToTracker(userId, { phone: lead.phone, price: closedPrice, videos: closedVideos, timezone: lead.timezone });
   } else if (dormant) {
     await upsertLeadPatch(userId, jid, { status: "dormant", negotiation: negOk, last_outbound_at: new Date().toISOString() });
+  } else if (checkBack) {
+    // Puerta abierta: no se muere. Sale de la negociación activa y entra a la
+    // rutina de preguntar cada 7 días.
+    await upsertLeadPatch(userId, jid, {
+      status: "checkback",
+      negotiation: { ...negOk, checkbackCount: 0, waiting: false, waitingNudges: 0 },
+      last_outbound_at: new Date().toISOString(),
+    });
+    console.log(`🔁 ${jid} pasa a seguimiento semanal (checkback).`);
   } else {
     await upsertLeadPatch(userId, jid, { status: "negociando", negotiation: negOk, last_outbound_at: new Date().toISOString() });
   }
@@ -338,6 +361,39 @@ export async function sweepTimers(sock, userId) {
       continue;
     }
 
+    // ══ SEGUIMIENTO SEMANAL — "ahorita no hay nada, pero te aviso" ══
+    // Estos contactos NO están muertos: dejaron la puerta abierta. Se les pregunta
+    // una vez por semana, máximo 4 veces (un mes). A los 7 días la ventana de 24h
+    // de WhatsApp ya cerró, así que va por template aprobado, que es lo único que
+    // Meta permite fuera de la ventana.
+    if (lead.status === "checkback") {
+      if (!coldSendsAllowed) continue; // respeta horario y días como cualquier envío en frío
+
+      const neg = lead.negotiation || {};
+      const done = Number(neg.checkbackCount || 0);
+
+      if (done >= MAX_CHECKBACKS) {
+        console.log(`😴 ${lead.jid} ya recibió ${MAX_CHECKBACKS} seguimientos semanales sin que saliera nada — se duerme.`);
+        await upsertLeadPatch(userId, lead.jid, { status: "dormant", last_outbound_at: new Date().toISOString() });
+        continue;
+      }
+
+      if (hoursSince(lead.last_outbound_at) < CHECKBACK_DAYS * 24) continue; // todavía no toca
+
+      try {
+        await sendFollowupTemplate(userId, lead.jid);
+        await appendMessage(userId, lead.jid, "assistant", "Hey, any updates?");
+        await upsertLeadPatch(userId, lead.jid, {
+          negotiation: { ...neg, checkbackCount: done + 1 },
+          last_outbound_at: new Date().toISOString(),
+        });
+        console.log(`🔁 Seguimiento semanal ${done + 1}/${MAX_CHECKBACKS} mandado a ${lead.jid}.`);
+      } catch (err) {
+        console.error(`❌ No se pudo mandar el seguimiento semanal a ${lead.jid}: ${err.message}`);
+      }
+      continue;
+    }
+
     // Ya no se manda el "message2" — después del mensaje 1, a las 24h arrancan
     // directo los follow-ups de "Hey, any updates?" (máximo 4).
     // El follow-up espera 25 horas (no 24) A PROPÓSITO: así cada mensaje cae una
@@ -389,26 +445,38 @@ export async function sweepTimers(sock, userId) {
     // máximo 4 veces. Si su ventana ya está por cerrar, se deja de intentar.
     if (lead.status === "negociando" && lead.negotiation?.waiting === true) {
       const nudges = Number(lead.negotiation.waitingNudges || 0);
-      const hoursSinceTheirs = hoursSince(lead.last_inbound_at);
-      if (
-        nudges < 4 &&
-        hoursSince(lead.last_outbound_at) >= 2 &&
-        hoursSinceTheirs < 23
-      ) {
+
+      // Se agotaron los días de espera y nunca contestaron: se deja descansar en
+      // vez de quedarse atorado para siempre en "negociando".
+      if (nudges >= MAX_WAITING_NUDGES) {
+        console.log(`😴 ${lead.jid} nunca volvió después de ${MAX_WAITING_NUDGES} días esperando su confirmación — se duerme.`);
+        await upsertLeadPatch(userId, lead.jid, { status: "dormant", last_outbound_at: new Date().toISOString() });
+        continue;
+      }
+
+      if (hoursSince(lead.last_outbound_at) >= WAITING_NUDGE_HOURS) {
         const nudgeText = "Hey, any updates?";
+        // Dentro de su ventana de 24h se puede mandar texto libre; fuera de ella
+        // Meta solo deja templates aprobados, y ahí sí aplica el horario de envío.
+        const insideWindow = hoursSince(lead.last_inbound_at) < 23;
+        if (!insideWindow && !coldSendsAllowed) continue;
         try {
-          await sock.sendMessage(lead.jid, { text: nudgeText });
+          if (insideWindow) {
+            await sock.sendMessage(lead.jid, { text: nudgeText });
+          } else {
+            await sendFollowupTemplate(userId, lead.jid);
+          }
           await appendMessage(userId, lead.jid, "assistant", nudgeText);
           await upsertLeadPatch(userId, lead.jid, {
             negotiation: { ...lead.negotiation, waitingNudges: nudges + 1 },
             last_outbound_at: new Date().toISOString(),
           });
-          console.log(`⏲️  Nudge ${nudges + 1}/4 ("any updates?") a ${lead.jid} — esperando a su equipo.`);
+          console.log(`⏲️  Día ${nudges + 1}/${MAX_WAITING_NUDGES} preguntando "any updates?" a ${lead.jid} — está confirmando con la marca${insideWindow ? "" : " (por template)"}.`);
         } catch (err) {
-          console.error(`❌ No se pudo mandar el nudge a ${lead.jid}: ${err.message}`);
+          console.error(`❌ No se pudo mandar el recordatorio a ${lead.jid}: ${err.message}`);
         }
       }
-      continue; // mientras esperan a su equipo, NO aplica el cierre automático de 18h
+      continue; // mientras confirman con la marca, NO aplica el cierre automático de 18h
     }
 
     if (lead.status === "negociando" && hoursSince(lead.last_outbound_at) >= HOURS_ACCEPT) {

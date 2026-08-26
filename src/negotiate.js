@@ -12,6 +12,10 @@ const MODEL_READER = process.env.NEGOTIATION_READER_MODEL || "claude-sonnet-5";
 
 const CLOSE_TAG_REGEX = /<<CLOSE:(\{.*?\})>>/s;
 const DORMANT_TAG_REGEX = /<<DORMANT>>/;
+// CHECKBACK = "ahorita no hay nada, pero te aviso". NO es un rechazo: la puerta
+// queda abierta y el sistema les vuelve a preguntar cada 7 días. Es distinto de
+// DORMANT, que sí es un cierre definitivo.
+const CHECKBACK_TAG_REGEX = /<<CHECKBACK>>/;
 
 /* ══════════════════════════════════════════════════════════════════════════════
    ARQUITECTURA HÍBRIDA (versión 3):
@@ -68,6 +72,7 @@ export function emptyState() {
     waiting: false,
     waitingSince: null,
     waitingNudges: 0,
+    checkbackCount: 0,
   };
 }
 
@@ -81,7 +86,8 @@ Return ONLY a JSON object — no preamble, no markdown fences — with exactly t
   "theirOffer": number or null,
   "claimsFinal": true or false,
   "waitingOnThem": true or false,
-  "wantsToEnd": true or false
+  "wantsToEnd": true or false,
+  "noBudgetForNow": true or false
 }
 
 How to fill each key:
@@ -89,7 +95,8 @@ How to fill each key:
 - "theirOffer": the total price the BRAND is offering right now, as a plain number. CRITICAL: prices are very often written with NO dollar sign. Read any format: "$1500", "1500", "1,500", "1500usd", "fifteen hundred", "1.5k", "1500 for 5 videos". If their latest message names no price, use null. NEVER report the creator's own number here.
 - "claimsFinal": true if they frame their number as a maximum/final/best/hard cap, or use pressure framing like "I fought for you with my team".
 - "waitingOnThem": true if their latest message says THEY need to do something before continuing — "I'll submit your profile", "let me check with my team", "I'll get back to you", "waiting for approval" — with NO new offer and NO rejection.
-- "wantsToEnd": true if they are ending or declining this conversation — "someone from my team is already talking to you", "let's not continue", "we already work with you", "not interested", a goodbye.
+- "wantsToEnd": true if they are DEFINITIVELY ending or declining — "someone from my team is already talking to you", "let's not continue", "we already work with you", "not interested", a flat no, a final goodbye with no future opening.
+- "noBudgetForNow": true ONLY if they say there is nothing/no budget/no campaign available RIGHT NOW **and** they leave the door open for later — "I'll let you know when something comes up", "I'll keep an eye out for other campaigns", "nothing right now but I'll reach out", "stay in touch". Both halves must be present: nothing now AND a future opening. A flat "no thanks" with no future opening is wantsToEnd, NOT this. If you are unsure which one it is, choose wantsToEnd and leave noBudgetForNow false.
 
 IMPORTANT: commission/affiliate percentages (e.g. "20% commission") are NEVER a price — never put them in "theirOffer".
 
@@ -100,7 +107,7 @@ async function readBrandMessage(conversation) {
   try {
     const res = await anthropic.messages.create({
       model: MODEL_READER,
-      max_tokens: 300,
+      max_tokens: 800,
       system: READER_SYSTEM,
       messages: [
         ...messages,
@@ -120,10 +127,11 @@ async function readBrandMessage(conversation) {
       claimsFinal: !!parsed.claimsFinal,
       waitingOnThem: !!parsed.waitingOnThem,
       wantsToEnd: !!parsed.wantsToEnd,
+      noBudgetForNow: !!parsed.noBudgetForNow,
     };
   } catch (err) {
     console.warn("⚠️  Lector sin JSON válido — se sigue sin datos nuevos:", err.message);
-    return { videos: null, theirOffer: null, claimsFinal: false, waitingOnThem: false, wantsToEnd: false };
+    return { videos: null, theirOffer: null, claimsFinal: false, waitingOnThem: false, wantsToEnd: false, noBudgetForNow: false };
   }
 }
 
@@ -203,6 +211,11 @@ function guardrailNote(guard, tier, state, r) {
       `NOTE: they appear to be ENDING this conversation (already handled by their team / not continuing). The right move is ONE brief, warm goodbye with NO prices, and append <<DORMANT>> at the end.`
     );
   }
+  if (r.noBudgetForNow && !r.wantsToEnd) {
+    lines.push(
+      `NOTE: they have nothing available right now but left the door open for the future. Do NOT push and do NOT state any price. Reply exactly: "Ok, thank you, please let me know if something comes up." and append <<CHECKBACK>> on the same line. The system will follow up with them automatically once a week.`
+    );
+  }
   return lines.join("\n");
 }
 
@@ -245,7 +258,8 @@ STYLE RULES (strict):
 - You can offer TWO package options at once to redirect the negotiation (e.g. a bigger bundle at a higher total, or a smaller one closer to their number) when they push on video count or bundle size.
 - The brand will often bring up unrelated relationship-building talk — long-term partnership, upcoming product launches, "let's do a trial run first," social proof. Do not engage with this substantively; brief neutral acknowledgment at most, then steer back to price/videos.
 - TEAM-REVIEW / "LET ME CHECK" MESSAGES: if the brand says THEY need to do something before continuing — "I'll submit your profile to the brand", "let me check with my team", "I'll get back to you", "waiting for approval" — and their message contains no new offer and no rejection, the correct move is to acknowledge briefly and WAIT: one short line like "Sounds good, let me know!" Do NOT restate a price, do NOT lower anything, do NOT keep negotiating in that reply.
-- IF THE BRAND ENDS THE CONVERSATION — they say someone from their team is already talking to you, this is a duplicate outreach, they're not interested, or any other clear goodbye/decline: reply with ONE brief, warm, professional goodbye with NO prices and NO attempt to keep negotiating (e.g. "No worries, thanks for letting me know! Feel free to reach out anytime."), and append this tag at the end: <<DORMANT>>
+- IF THE BRAND ENDS THE CONVERSATION FOR GOOD — they say someone from their team is already talking to you, this is a duplicate outreach, they're not interested, or any other clear goodbye/decline with NO future opening: reply with ONE brief, warm, professional goodbye with NO prices and NO attempt to keep negotiating (e.g. "No worries, thanks for letting me know! Feel free to reach out anytime."), and append this tag at the end: <<DORMANT>>
+- THEY NEED TO CONFIRM WITH THE BRAND FIRST: many of these contacts are middlemen — once you agree on a number they still have to get it approved on their side, and that commonly takes ONE TO TWO DAYS. If they say they're taking your price to the brand, waiting on approval, or confirming internally: acknowledge in one short line, state NO prices, and do not treat the silence that follows as a rejection. The system paces the follow-ups for you — never chase them in the same message.
 
 HOW THE NEGOTIATION ACTUALLY FLOWS (this is the real pattern to follow, step by step):
 1. OPEN AT YOUR ANCHOR. The first time you counter after the brand names any price (even a lowball opening offer), state your full anchor number directly, e.g. "I can do $300 for 1 video." Don't pre-discount yourself before they've even pushed back, and never open with your mid or floor number even if the gaps are small — always start at anchor first.
@@ -272,7 +286,12 @@ HOW THE NEGOTIATION ACTUALLY FLOWS (this is the real pattern to follow, step by 
   3. Your next planned number would land at or below mid, and the guardrail below shows fewer than 2 hold rounds completed → hold at mid instead. This applies EVEN IF the brand just claimed a low number is their final/max offer.
   4. Offer below mid but above floor (after mid resistance is complete per the guardrail), or offer below floor → push back with a reason first, then step down toward it per the pattern above, never below their stated number, never below your floor.
   5. They go quiet/stall → hold your position; the system's own follow-up timing handles re-engagement.
-- NO-BUDGET HANDLING: if the brand says they have no budget/no campaigns right now but may reach out later — do NOT keep pushing. Reply with exactly: "Ok, thank you, please let me know if something comes up." and append this tag on the same line: <<DORMANT>>
+- NOTHING AVAILABLE RIGHT NOW, DOOR LEFT OPEN — USE <<CHECKBACK>>: a lot of these contacts are agents/middlemen who handle several brands at once. When they say there is no campaign or no budget for you RIGHT NOW **but** they will let you know when something comes up (or they ask you to stay in touch, or say they'll keep an eye out for other campaigns) — that is NOT a rejection. Do NOT keep pushing and do NOT state any price. Reply with exactly: "Ok, thank you, please let me know if something comes up." and append this tag on the same line: <<CHECKBACK>>
+  The system then checks back with them automatically once a week, so you do not need to chase them yourself.
+- CHOOSING BETWEEN THE TWO CLOSING TAGS — this matters a lot, get it right:
+  - <<CHECKBACK>> = the door is OPEN for the future. Nothing right now, but they said they'd reach out / asked you to stay in touch.
+  - <<DORMANT>> = the door is CLOSED. Someone else on their team already handles you, duplicate outreach, flat "not interested", a goodbye with no future opening.
+  If a message could be read either way, use <<DORMANT>> — it is far worse to keep messaging someone who already said no than to let a maybe go quiet.
 
 CLOSING PROTOCOL — this is critical for the system that reads your output. There are two paths depending on how the price was reached:
 
@@ -321,7 +340,7 @@ async function callBrain(system, conversation) {
   const messages = conversation.map((m) => ({ role: m.role, content: m.content }));
   const response = await anthropic.messages.create({
     model: MODEL_BRAIN,
-    max_tokens: 300,
+    max_tokens: 1200,
     system,
     messages,
   });
@@ -376,13 +395,13 @@ export async function getNextMove(conversation, tiers, negState = null, opts = {
     const realOffer = newState.theirBest ?? newState.theirLast ?? null;
     if (realOffer == null) {
       console.warn("⏹️  forceAccept sin oferta real de la marca — no se cierra nada.");
-      return { replyText: null, noAction: true, closed: false, dormant: false, closedPrice: null, closedVideos: null, negotiation: newState };
+      return { replyText: null, noAction: true, closed: false, dormant: false, checkBack: false, closedPrice: null, closedVideos: null, negotiation: newState };
     }
     const v = videos || newState.videos || null;
     const line = v
       ? `Sounds good, let's move forward with ${v} videos for $${realOffer}.`
       : `Sounds good, let's move forward at $${realOffer}.`;
-    return { replyText: line, noAction: false, closed: true, dormant: false, closedPrice: realOffer, closedVideos: v, negotiation: newState };
+    return { replyText: line, noAction: false, closed: true, dormant: false, checkBack: false, closedPrice: realOffer, closedVideos: v, negotiation: newState };
   }
 
   // ── Cerebro: prompt completo + candado calculado ──
@@ -392,10 +411,12 @@ export async function getNextMove(conversation, tiers, negState = null, opts = {
     guard = computeGuardrail(newState, r, tier, ladder);
     system += "\n" + guardrailNote(guard, tier, newState, r);
     console.log(`🔒 Candado: mínimo permitido $${guard.minAllowed}${guard.holdNoPushback ? " (sin empujón — no bajar)" : ""}${guard.mustOpenAtAnchor ? " (apertura: ancla)" : ""}`);
-  } else if (r.wantsToEnd || (r.waitingOnThem && their == null)) {
+  } else if (r.wantsToEnd || r.noBudgetForNow || (r.waitingOnThem && their == null)) {
     // Sin paquete definido, pero el contexto pide espera/despedida — se recuerda igual
     system += "\n\n=== NOTE ===" + (r.wantsToEnd
-      ? "\nThey appear to be ENDING this conversation. One brief warm goodbye, NO prices, append <<DORMANT>>."
+      ? "\nThey appear to be ENDING this conversation for good. One brief warm goodbye, NO prices, append <<DORMANT>>."
+      : r.noBudgetForNow
+      ? "\nThey have nothing right now but left the door open. Reply exactly: \"Ok, thank you, please let me know if something comes up.\" and append <<CHECKBACK>>. NO prices."
       : "\nThey said they'll check with their team. Acknowledge briefly (\"Sounds good, let me know!\"), NO prices.");
   }
 
@@ -405,7 +426,7 @@ export async function getNextMove(conversation, tiers, negState = null, opts = {
     rawText = await callBrain(system, conversation);
   }
   if (!rawText) {
-    return { replyText: "Sorry, could you repeat that?", noAction: false, closed: false, dormant: false, closedPrice: null, closedVideos: null, negotiation: newState };
+    return { replyText: "Sorry, could you repeat that?", noAction: false, closed: false, dormant: false, checkBack: false, closedPrice: null, closedVideos: null, negotiation: newState };
   }
 
   // ── Candado de cierre: el precio del tag DEBE existir en la conversación ──
@@ -440,7 +461,7 @@ export async function getNextMove(conversation, tiers, negState = null, opts = {
   }
 
   // ── Candado de mínimos: ningún número del paquete por debajo del permitido ──
-  const isTagged = CLOSE_TAG_REGEX.test(rawText) || DORMANT_TAG_REGEX.test(rawText);
+  const isTagged = CLOSE_TAG_REGEX.test(rawText) || DORMANT_TAG_REGEX.test(rawText) || CHECKBACK_TAG_REGEX.test(rawText);
   if (guard && tier && !isTagged) {
     const bad = amountsInBand(rawText, tier).filter((n) => n < guard.minAllowed);
     if (bad.length) {
@@ -483,13 +504,20 @@ export async function getNextMove(conversation, tiers, negState = null, opts = {
     try {
       const parsed = JSON.parse(finalClose[1]);
       const cleanText = rawText.replace(CLOSE_TAG_REGEX, "").trim();
-      return { replyText: cleanText, noAction: false, closed: true, dormant: false, closedPrice: Number(parsed.price), closedVideos: Number(parsed.videos) || videos || null, negotiation: newState };
+      return { replyText: cleanText, noAction: false, closed: true, dormant: false, checkBack: false, closedPrice: Number(parsed.price), closedVideos: Number(parsed.videos) || videos || null, negotiation: newState };
     } catch { /* tag malformado → se trata como no cerrado */ }
   }
+  // DORMANT se revisa PRIMERO a propósito: si el cerebro llegara a poner los dos
+  // tags por confusión, gana el que NO vuelve a escribirle a la marca.
   if (DORMANT_TAG_REGEX.test(rawText)) {
-    const cleanText = rawText.replace(DORMANT_TAG_REGEX, "").trim();
-    return { replyText: cleanText, noAction: false, closed: false, dormant: true, closedPrice: null, closedVideos: null, negotiation: newState };
+    const cleanText = rawText.replace(DORMANT_TAG_REGEX, "").replace(CHECKBACK_TAG_REGEX, "").trim();
+    return { replyText: cleanText, noAction: false, closed: false, dormant: true, checkBack: false, closedPrice: null, closedVideos: null, negotiation: newState };
+  }
+  if (CHECKBACK_TAG_REGEX.test(rawText)) {
+    const cleanText = rawText.replace(CHECKBACK_TAG_REGEX, "").trim();
+    console.log("🔁 CHECKBACK: no hay nada ahorita pero dejaron la puerta abierta — se les vuelve a preguntar cada 7 días.");
+    return { replyText: cleanText, noAction: false, closed: false, dormant: false, checkBack: true, closedPrice: null, closedVideos: null, negotiation: { ...newState, checkbackCount: 0 } };
   }
 
-  return { replyText: rawText, noAction: false, closed: false, dormant: false, closedPrice: null, closedVideos: null, negotiation: newState };
+  return { replyText: rawText, noAction: false, closed: false, dormant: false, checkBack: false, closedPrice: null, closedVideos: null, negotiation: newState };
 }
