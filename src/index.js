@@ -14,7 +14,27 @@ import { startProcessForNumber } from "./queue.js";
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+
+// El límite por defecto de Express son 100kb, y con eso 360dialog PERDÍA mensajes:
+// cualquier webhook más pesado (imágenes, audios, documentos, mensajes largos) se
+// rechazaba con "PayloadTooLargeError" ANTES de que el bot pudiera verlo — o sea
+// que ese mensaje nunca existía para el sistema. 25mb es el tope real de Meta.
+app.use(express.json({ limit: "25mb" }));
+
+// Si aun así llega algo que Express no puede leer, se registra con claridad en vez
+// de soltar un error feo sin contexto, y se contesta 200 para que 360dialog no se
+// quede reintentando el mismo mensaje una y otra vez.
+app.use((err, req, res, next) => {
+  if (err && (err.type === "entity.too.large" || err.status === 413)) {
+    console.error(`🚨 Llegó un mensaje MÁS GRANDE que el límite en ${req.originalUrl} — se perdió. Sube el límite en index.js.`);
+    return res.sendStatus(200);
+  }
+  if (err && err.type === "entity.parse.failed") {
+    console.error(`🚨 Llegó un mensaje con formato ilegible en ${req.originalUrl} — se ignora.`);
+    return res.sendStatus(200);
+  }
+  return next(err);
+});
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
