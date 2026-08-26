@@ -205,7 +205,7 @@ async function resolveAndSend(sock, userId, jid) {
 
   // El mensaje SÍ salió, así que el contador de rescates se pone en cero: este
   // lead ya está sano otra vez.
-  const negOk = { ...(negotiation || {}), rescueTries: 0, rescueGaveUp: false };
+  const negOk = { ...(negotiation || {}), rescueTries: 0, rescueGaveUp: false, autoCloseGaveUp: false };
 
   if (closed) {
     await upsertLeadPatch(userId, jid, { status: "cerrado", negotiation: negOk, last_outbound_at: new Date().toISOString() });
@@ -411,20 +411,27 @@ export async function sweepTimers(sock, userId) {
 
       const neg = lead.negotiation || {};
       const tries = Number(neg.rescueTries || 0);
-      if (tries >= MAX_RESCUE_TRIES) continue; // ya se intentó suficiente, no insistir más
-
-      // Fuera de la ventana de 24h de WhatsApp no se puede mandar texto libre:
-      // el envío fallaría con [131047]. Se marca el lead con el motivo y se deja
-      // para revisión a mano. El aviso se escribe UNA sola vez, no en cada barrido.
       const horas = hoursSince(lead.last_inbound_at);
-      if (horas >= 23.5) {
+
+      // Se acaba el rescate por cualquiera de dos razones:
+      //   - se cerró la ventana de 24h de WhatsApp (ya no se puede mandar texto libre)
+      //   - o se gastaron los intentos permitidos
+      // En AMBOS casos hay que dejar constancia. Antes solo se marcaba el primer
+      // caso: si los intentos se acababan primero, el contacto se quedaba mudo en
+      // "negociando" para siempre, sin aviso, sin motivo guardado y sin log.
+      const ventanaCerrada = horas >= 23.5;
+      const sinIntentos = tries >= MAX_RESCUE_TRIES;
+
+      if (ventanaCerrada || sinIntentos) {
         if (!neg.rescueGaveUp) {
           console.error(
-            `🔇 ${lead.jid}: la marca escribió hace ${Math.round(horas)}h y el bot NUNCA contestó. La ventana de 24h ya cerró — REVÍSALO A MANO.`
+            `🔇 ${lead.jid}: la marca escribió hace ${Math.round(horas)}h y el bot no logró contestarle (${ventanaCerrada ? "la ventana de 24h ya cerró" : `falló ${tries} intentos`}) — REVÍSALO A MANO.`
           );
           await upsertLeadPatch(userId, lead.jid, {
             negotiation: { ...neg, rescueGaveUp: true },
-            last_error: "El bot no alcanzó a contestar este mensaje y la ventana de 24h ya cerró. Contéstalo a mano.",
+            last_error: ventanaCerrada
+              ? "El bot no alcanzó a contestar este mensaje y la ventana de 24h ya cerró. Contéstalo a mano."
+              : "El bot intentó contestar este mensaje varias veces y no pudo. Contéstalo a mano.",
           });
         }
         continue;
@@ -587,14 +594,29 @@ export async function sweepTimers(sock, userId) {
     }
 
     if (lead.status === "negociando" && hoursSince(lead.last_outbound_at) >= HOURS_ACCEPT) {
+      // Si ya se intentó el cierre automático y resultó que no había ninguna oferta
+      // real que aceptar, NO se le vuelve a preguntar a la IA en cada barrido: la
+      // conversación no cambió, la respuesta sería la misma, y cada intento cuesta
+      // dinero (una llamada a Opus + una a Sonnet). La marca se limpia sola en
+      // cuanto la marca vuelva a escribir y el bot le conteste.
+      if (lead.negotiation?.autoCloseGaveUp) continue;
+
       // La ventana de 24h de WhatsApp se cuenta desde el ÚLTIMO mensaje que ELLOS
       // mandaron. Si ya se pasó, el texto libre va a fallar sí o sí ([131047]), así
       // que ni se intenta — se deja el lead para revisarlo a mano.
       const hoursSinceTheirReply = hoursSince(lead.last_inbound_at);
       if (hoursSinceTheirReply >= 23.5) {
+        // Aquí ya no hay nada que el bot pueda hacer: la marca no volvió y Meta ya
+        // no deja mandar texto libre. Antes esto se quedaba así PARA SIEMPRE,
+        // repitiendo este mismo aviso en cada barrido y apareciendo en el panel
+        // como si la negociación siguiera viva. Ahora se manda a dormir de una vez.
         console.warn(
-          `⏰ ${lead.jid}: la ventana de 24h ya cerró (${Math.round(hoursSinceTheirReply)}h desde su último mensaje) — no se intenta el cierre automático.`
+          `⏰ ${lead.jid}: la marca no volvió y la ventana de 24h cerró (${Math.round(hoursSinceTheirReply)}h) — se manda a dormir.`
         );
+        await upsertLeadPatch(userId, lead.jid, {
+          status: "dormant",
+          last_error: "La marca dejó de contestar y la ventana de 24h de WhatsApp cerró.",
+        });
         continue;
       }
 
@@ -609,8 +631,11 @@ export async function sweepTimers(sock, userId) {
       // No había ninguna oferta real de la marca guardada — no se inventa nada.
       // Se deja el lead tal cual para revisarlo a mano.
       if (noAction || !replyText) {
-        console.warn(`⏹️  ${lead.jid}: no se cerró nada automáticamente (no hay oferta real de la marca). Revísalo a mano.`);
-        await upsertLeadPatch(userId, lead.jid, { negotiation });
+        console.warn(`⏹️  ${lead.jid}: no se cerró nada automáticamente (no hay oferta real de la marca). Revísalo a mano — no se vuelve a intentar solo.`);
+        await upsertLeadPatch(userId, lead.jid, {
+          negotiation: { ...(negotiation || {}), autoCloseGaveUp: true },
+          last_error: "No hay una oferta real de la marca que se pueda aceptar. Revísalo a mano.",
+        });
         continue;
       }
 
