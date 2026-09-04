@@ -230,14 +230,71 @@ export async function restoreExistingSessions() {
   console.log("Usando API oficial de WhatsApp — no hay sesiones locales que restaurar.");
 }
 
-export function startGlobalSweep() {
-  setInterval(async () => {
-    const { data: channels } = await supabase.from("whatsapp_channels").select("user_id");
-    for (const { user_id } of channels || []) {
+/* ═══════════════════════════════════════════════════════════════════════════
+   EL BARRIDO — el reloj que manda mensajes 1, follow-ups y seguimientos.
+   Antes esto NO IMPRIMÍA NADA: ni cuándo corría, ni cuántas cuentas encontraba,
+   ni si el horario permitía enviar. Si la consulta a Supabase fallaba, se
+   quedaba callado y nadie se enteraba — había que adivinar. Ahora deja rastro
+   en cada vuelta.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+let barridoCorriendo = false;
+let barridoNumero = 0;
+
+async function correrBarridoUnaVez() {
+  // Si el anterior todavía no acaba (por ejemplo hay muchas cuentas o la IA se
+  // tardó), no se encima otro encima — se salta esta vuelta y ya.
+  if (barridoCorriendo) {
+    console.warn("⏭️  El barrido anterior sigue trabajando — se salta esta vuelta para no encimarse.");
+    return;
+  }
+  barridoCorriendo = true;
+  const n = ++barridoNumero;
+  const inicio = Date.now();
+
+  try {
+    const { data: channels, error } = await supabase.from("whatsapp_channels").select("user_id");
+
+    // Antes este error era invisible: si Supabase fallaba, el barrido no hacía
+    // nada y no había forma de saberlo.
+    if (error) {
+      console.error(`🧹 BARRIDO #${n}: NO se pudo leer la lista de cuentas — ${error.message}. Esta vuelta no se hizo nada.`);
+      return;
+    }
+
+    const cuentas = channels || [];
+    console.log(`🧹 BARRIDO #${n} arrancando — ${cuentas.length} cuenta(s) con WhatsApp conectado.`);
+    if (!cuentas.length) {
+      console.warn("🧹 No hay ninguna cuenta con WhatsApp conectado — no hay nada que barrer.");
+      return;
+    }
+
+    for (const { user_id } of cuentas) {
       const fakeSock = {
         sendMessage: async (toJid, content) => sendMessage(user_id, toJid, content.text),
       };
-      sweepTimers(fakeSock, user_id).catch((err) => console.error(`Error en sweepTimers de ${user_id}:`, err));
+      // Cada cuenta va aislada: si una truena, las demás siguen barriéndose.
+      try {
+        await sweepTimers(fakeSock, user_id);
+      } catch (err) {
+        console.error(`❌ El barrido de la cuenta ${user_id} falló: ${err.message} — se sigue con las demás.`);
+      }
     }
-  }, CHECK_INTERVAL_MS);
+
+    console.log(`🧹 BARRIDO #${n} terminado en ${Math.round((Date.now() - inicio) / 1000)}s.`);
+  } catch (err) {
+    console.error(`❌ El barrido #${n} tronó por completo: ${err.message}`);
+  } finally {
+    barridoCorriendo = false;
+  }
+}
+
+export function startGlobalSweep() {
+  const minutos = Math.round(CHECK_INTERVAL_MS / 60000);
+  console.log(`🧹 Barrido programado cada ${minutos} minutos. La primera vuelta arranca en 15 segundos.`);
+
+  // La primera vuelta arranca casi de inmediato. Antes había que esperar los 30
+  // minutos completos: si Railway se reiniciaba seguido, podía no correr nunca.
+  setTimeout(() => { correrBarridoUnaVez(); }, 15000);
+  setInterval(() => { correrBarridoUnaVez(); }, CHECK_INTERVAL_MS);
 }

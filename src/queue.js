@@ -368,6 +368,15 @@ export async function sweepTimers(sock, userId) {
 
   const active = await listActiveLeads(userId);
 
+  // Este renglón es el que faltaba para dejar de adivinar: dice cuántos contactos
+  // hay, en qué etapa están, y si el horario permite enviar en frío ahorita.
+  const porEtapa = {};
+  for (const l of active) porEtapa[l.status] = (porEtapa[l.status] || 0) + 1;
+  const resumen = Object.entries(porEtapa).map(([k, v]) => `${k}:${v}`).join(" ") || "ninguno";
+  console.log(
+    `🧹 Cuenta ${userId}: ${active.length} contacto(s) activo(s) [${resumen}] — envíos en frío ${coldSendsAllowed ? "PERMITIDOS" : "BLOQUEADOS (fuera del horario 8pm-8am, o noche de viernes/sábado)"}.`
+  );
+
   for (const lead of active) {
    // CADA CONTACTO VA AISLADO. Antes, si a UNO le tronaba el envío (número
    // inválido, Meta lo rechaza, se cae la red), el error reventaba el ciclo
