@@ -130,8 +130,8 @@ async function readBrandMessage(conversation) {
       noBudgetForNow: !!parsed.noBudgetForNow,
     };
   } catch (err) {
-    console.warn("⚠️  Lector sin JSON válido — se sigue sin datos nuevos:", err.message);
-    return { videos: null, theirOffer: null, claimsFinal: false, waitingOnThem: false, wantsToEnd: false, noBudgetForNow: false };
+    console.warn("No se pudo interpretar la respuesta de la marca:", err.status || err.name);
+    throw new Error("La IA no pudo interpretar la conversación. Se detuvo este intento.");
   }
 }
 
@@ -276,7 +276,7 @@ HOW THE NEGOTIATION ACTUALLY FLOWS (this is the real pattern to follow, step by 
 - SMALL-GAP PACKAGES: if the gaps between anchor/mid/floor are small (e.g. a single video), still apply the full two-round hold at mid before moving to floor — never let a small numeric gap turn into an instant cave; the number of rounds you make them fight through matters more than how big each step is.
 8. IF THEY HOLD FIRM AT THE SAME LOW NUMBER 2-3 TIMES with no movement at all (after you've already done your mid resistance and are now near the floor), escalate the framing once more — "take it or leave it" style ("$650 for 3, that's as far as I go — you in or not?"). This is a normal closing tactic, not rudeness.
 9. IF THEY STILL WON'T BUDGE after that and their number is at/above your floor, accept it — you've genuinely pushed as far as it goes.
-10. IF THEY GO QUIET (stop replying) while their offer is still below your floor, don't chase them — hold your position and don't send a follow-up in the same message. The system already handles this: after enough time with no reply, it will automatically move forward with whatever their last stated offer was, so you don't need to manufacture urgency yourself.
+10. IF THEY GO QUIET (stop replying) while their offer is still below your floor, don't chase them — hold your position and don't send a follow-up in the same message. The system already handles this: after enough time with no reply, it can only accept a confirmed offer for the same package that meets your floor, so you don't need to manufacture urgency yourself.
 11. IF THEY DO reply again after a quiet period with a slightly higher number, treat it as a fresh negotiation turn and keep applying this same pattern.
 - CRITICAL: NEVER state a new price that is lower than any offer the brand has already put on the table. If the brand offers $900, your next number can go up, hold, or move toward a number at/above $900 — it can never drop below $900. Every number you say must move only toward the brand's numbers, never randomly downward.
 - DO NOT TRUST "FINAL OFFER" CLAIMS THE FIRST TIME. Brands routinely claim a number is their absolute max as a tactic — phrases like "that's the highest we can offer," "I just advocated for you with our team," "this is our hard cap," or emotional/reward framing are common negotiating tactics, not proof of finality. The FIRST time the brand claims finality, treat it with mild skepticism: push back once more per the pattern above — a "final offer" claim never skips or shortens the mandatory two-round mid hold. Only accept a "final" number after the brand reaffirms that same number a second time following your pushback. Real finality reveals itself through repetition.
@@ -360,9 +360,10 @@ async function callBrain(system, conversation) {
  * @param {{forceAccept?:boolean}} opts
  */
 export async function getNextMove(conversation, tiers, negState = null, opts = {}) {
+  conversation = [...conversation].sort((a,b)=>Number(a.ts || 0)-Number(b.ts || 0));
   const state = { ...emptyState(), ...(negState || {}) };
 
-  const r = await readBrandMessage(conversation);
+  const r = await (opts.readBrand || readBrandMessage)(conversation);
   console.log(`🔎 Lectura: ${JSON.stringify(r)}`);
 
   // Estado del lado de ELLOS
@@ -371,6 +372,8 @@ export async function getNextMove(conversation, tiers, negState = null, opts = {
   if (their != null) {
     repeatCount = state.theirLast != null && their === state.theirLast ? repeatCount + 1 : 1;
   }
+  const changedPackage = r.videos && state.videos && Number(r.videos) !== Number(state.videos);
+  if (changedPackage) { Object.assign(state, emptyState()); repeatCount = their != null ? 1 : 0; }
   const theirBest = Math.max(their ?? 0, state.theirBest ?? 0) || null;
   const finalityClaims = state.finalityClaims + (r.claimsFinal ? 1 : 0);
   const videos = r.videos || state.videos;
@@ -392,8 +395,8 @@ export async function getNextMove(conversation, tiers, negState = null, opts = {
 
   // ── Cierre forzado (18h sin respuesta): SOLO con oferta real de la marca ──
   if (opts.forceAccept) {
-    const realOffer = newState.theirBest ?? newState.theirLast ?? null;
-    if (realOffer == null) {
+    const realOffer = newState.theirLast ?? null;
+    if (realOffer == null || !tier || Number(realOffer) < Number(tier.floor)) {
       console.warn("⏹️  forceAccept sin oferta real de la marca — no se cierra nada.");
       return { replyText: null, noAction: true, closed: false, dormant: false, checkBack: false, closedPrice: null, closedVideos: null, negotiation: newState };
     }

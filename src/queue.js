@@ -11,6 +11,8 @@ import {
   getPricingTiers,
   getUserEmail,
 } from "./state.js";
+import { assertCanSend } from "./zernio-control.js";
+import { safeClose } from "./zernio-policy.js";
 import { getNextMove } from "./negotiate.js";
 import { sendOpeningTemplate, sendFollowupTemplate } from "./sessions.js";
 
@@ -22,7 +24,7 @@ import { sendOpeningTemplate, sendFollowupTemplate } from "./sessions.js";
 const HOURS_ACCEPT = Number(process.env.HOURS_BEFORE_ACCEPT_LAST_OFFER || 18);
 const SEND_WINDOW_START_HOUR_CT = Number(process.env.SEND_WINDOW_START_HOUR_CT ?? 20);
 const SEND_WINDOW_END_HOUR_CT = Number(process.env.SEND_WINDOW_END_HOUR_CT ?? 8);
-const DEBOUNCE_MS = Number(process.env.REPLY_DEBOUNCE_SECONDS || 300) * 1000;
+const DEBOUNCE_MS = Number(process.env.REPLY_DEBOUNCE_SECONDS ?? (Number(process.env.REPLY_DEBOUNCE_MINUTES || 5) * 60)) * 1000;
 
 // ═══ RED DE SEGURIDAD PARA RESPUESTAS PERDIDAS ═══
 // El temporizador que contesta a la marca vive en la MEMORIA del servidor. Si
@@ -63,7 +65,7 @@ const MAX_DORMANT_RETRIES_PER_SWEEP = Number(process.env.MAX_DORMANT_RETRIES_PER
 //   - contesta a los 45 segundos (en vez de 5 minutos)
 //   - manda a cualquier hora y cualquier día (sin ventana 10pm-7am ni bloqueo Vie/Sáb)
 // Todas las demás cuentas siguen el reglamento normal de producción.
-const TEST_MODE_USER_IDS = (process.env.TEST_MODE_USER_IDS || "d5c3e03b-5ac0-45d9-9852-b3cc9abe95b3")
+const TEST_MODE_USER_IDS = (process.env.TEST_MODE_USER_IDS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -158,24 +160,11 @@ export async function startProcessForNumber(sock, userId, phoneRaw, { skipMessag
     return { duplicate: false, lead: updated, waitingForWindow: false, manual: true };
   }
 
-  if (!withinSendWindow(userId)) {
-    console.log(`🌙 Fuera de la ventana de envío ahorita mismo — ${phoneRaw} queda en "nuevo", se manda en el próximo sweep.`);
-    return { duplicate: false, lead, waitingForWindow: true };
-  }
-
-  const params = await buildOpeningTemplateParams(userId);
-  console.log(`📋 Params del template para ${phoneRaw}: ${JSON.stringify(params)}`);
-  await sendOpeningTemplate(userId, lead.jid, params);
-  console.log(`✅ Template mandado sin error para ${phoneRaw} (jid: ${lead.jid})`);
-  await appendMessage(userId, lead.jid, "assistant", "[Opening template message sent]");
-  const updated = await upsertLeadPatch(userId, lead.jid, {
-    status: "escrito_enviado",
-    last_outbound_at: new Date().toISOString(),
-  });
-  return { duplicate: false, lead: updated, waitingForWindow: false };
+  return {duplicate:false,lead,queued:true};
 }
 
 async function resolveAndSend(sock, userId, jid) {
+  await assertCanSend(userId);
   const lead = await getLead(userId, jid);
   if (!lead || lead.status === "cerrado" || lead.paused) {
     console.log(`⚠️  resolveAndSend: no se contesta a ${jid} (status: ${lead?.status}, paused: ${lead?.paused})`);
@@ -199,6 +188,7 @@ async function resolveAndSend(sock, userId, jid) {
 
   // Se manda PRIMERO. Si falla, no se marca nada como cerrado — así nunca queda
   // un trato "cerrado" en el sistema que la marca nunca recibió.
+  if (closed && !safeClose(tiers, closedPrice, closedVideos)) throw new Error("El cierre no respeta el precio mínimo del paquete.");
   await sock.sendMessage(jid, { text: replyText });
   console.log(`📤 Mensaje enviado a ${jid}`);
   await appendMessage(userId, jid, "assistant", replyText);
@@ -227,10 +217,8 @@ async function resolveAndSend(sock, userId, jid) {
   }
 }
 
-/** Called on every inbound WhatsApp message. If the exact jid doesn't match any lead
- * (common with Mexico numbers, where WhatsApp sometimes adds/drops the extra "1" after
- * the 52 country code), falls back to matching by the last 8 digits of the phone. */
-export async function handleInboundMessage(sock, userId, jid, text) {
+/** Match the complete phone inside this tenant; never guess from a suffix. */
+export async function handleInboundMessage(sock, userId, jid, text, {recorded=false}={}) {
   console.log(`🔍 handleInboundMessage: buscando lead para ${jid} (user ${userId})`);
   let lead = await getLead(userId, jid);
   let resolvedJid = jid;
@@ -249,8 +237,7 @@ export async function handleInboundMessage(sock, userId, jid, text) {
     return;
   }
 
-  await appendMessage(userId, resolvedJid, "user", text);
-  await upsertLeadPatch(userId, resolvedJid, { last_inbound_at: new Date().toISOString() });
+  if (!recorded) await appendMessage(userId, resolvedJid, "user", text);
 
   if (lead.paused) {
     console.log(`⏸️  Lead ${resolvedJid} está pausado — no se contesta`);
@@ -358,6 +345,7 @@ async function retryDormantLeads(userId, coldSendsAllowed) {
 }
 
 export async function sweepTimers(sock, userId) {
+  await assertCanSend(userId);
   // El horario de envío (8pm–8am CT, dom–jue) aplica SOLO a lo que el bot inicia
   // en frío: mensaje 1 y follow-ups. Las piezas urgentes de conversaciones VIVAS
   // (el cierre a 18h y los nudges de "any updates?" mientras su equipo revisa) NO
@@ -651,6 +639,7 @@ export async function sweepTimers(sock, userId) {
       // El mensaje se manda PRIMERO. Solo si de verdad salió se marca como cerrado —
       // así nunca queda un trato "cerrado" en el sistema que la marca nunca recibió.
       try {
+        if (closed && !safeClose(tiers, closedPrice, closedVideos)) throw new Error("El cierre no respeta el precio mínimo del paquete.");
         await sock.sendMessage(lead.jid, { text: replyText });
       } catch (err) {
         console.error(`❌ ${lead.jid}: no se pudo mandar el cierre automático (${err.message}). NO se marca como cerrado.`);

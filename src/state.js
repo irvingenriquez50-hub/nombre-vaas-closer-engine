@@ -1,4 +1,5 @@
 import { supabase } from "./supabase.js";
+import { canonicalPhone, validPhone } from "./zernio-policy.js";
 
 export async function getUserEmail(userId) {
   const { data } = await supabase.from("users").select("email").eq("id", userId).maybeSingle();
@@ -19,7 +20,7 @@ export async function findLeadByAnyDigits(userId, candidateIdentifiers) {
     const leadDigits = (lead.phone || "").replace(/[^0-9]/g, "");
     if (!leadDigits) continue;
     for (const d of digitsList) {
-      if (leadDigits.slice(-8) === d.slice(-8)) return lead;
+      if (canonicalPhone(leadDigits) === canonicalPhone(d)) return lead;
     }
   }
   return null;
@@ -31,7 +32,8 @@ export async function getLead(userId, jid) {
 }
 
 export async function addLead(userId, phoneRaw) {
-  const digits = phoneRaw.replace(/[^0-9]/g, "");
+  if (!validPhone(phoneRaw)) throw new Error("Número inválido; incluye el código de país.");
+  const digits = canonicalPhone(phoneRaw);
   const jid = digits;
   const existing = await getLead(userId, jid);
   if (existing) return { lead: existing, duplicate: true };
@@ -57,10 +59,12 @@ export async function upsertLeadPatch(userId, jid, patch) {
   return data;
 }
 
-export async function appendMessage(userId, jid, role, content) {
-  const lead = await getLead(userId, jid);
-  const conversation = [...(lead?.conversation || []), { role, content, ts: Date.now() }];
-  return upsertLeadPatch(userId, jid, { conversation });
+export async function appendMessage(userId, jid, role, content, {eventId=null,at=null}={}) {
+  const parsed=Date.parse(at);
+  const timestamp=Number.isFinite(parsed) && parsed<=Date.now()+60000 ? new Date(parsed).toISOString() : new Date().toISOString();
+  const {data,error}=await supabase.rpc('closer_append_message',{p_user:userId,p_jid:jid,p_role:role,p_content:content,p_event:eventId,p_at:timestamp});
+  if(error) throw error;
+  return data;
 }
 
 export async function listActiveLeads(userId) {
@@ -107,7 +111,7 @@ export async function markLeadFailed(userId, jidDigits, errorMsg) {
     .neq("status", "cerrado");
   if (!data) return null;
 
-  const lead = data.find((l) => (l.jid || "").replace(/[^0-9]/g, "").slice(-8) === jidDigits.slice(-8));
+  const lead = data.find((l) => canonicalPhone(l.jid) === canonicalPhone(jidDigits));
   if (!lead) return null;
   if (!["nuevo", "escrito_enviado"].includes(lead.status)) return null;
 
