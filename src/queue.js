@@ -1,5 +1,6 @@
 import {withLease} from './autopilot.js';
 import {deferred} from './outreach-policy.js';
+import {markExistingCollaboration} from './contact-review.js';
 import {
   addLead,
   appendMessage,
@@ -179,7 +180,7 @@ async function resolveAndSendLocked(sock, userId, jid) {
 
   console.log(`🤖 Llamando a la IA para generar la respuesta a ${jid}...`);
   const tiers = await getPricingTiers(userId);
-  const { replyText, noAction, closed, dormant, checkBack, closedPrice, closedVideos, negotiation } = await getNextMove(
+  const { replyText, noAction, existingCollaboration, closed, dormant, checkBack, closedPrice, closedVideos, negotiation } = await getNextMove(
     lead.conversation,
     tiers,
     lead.negotiation || null,
@@ -187,6 +188,14 @@ async function resolveAndSendLocked(sock, userId, jid) {
   );
   console.log(`🤖 Respuesta final: "${replyText}" (closed: ${closed}, dormant: ${dormant}, checkBack: ${!!checkBack})`);
 
+  if(existingCollaboration) {
+    const latest=await getLead(userId,jid);
+    if(latest?.last_inbound_at===lead.last_inbound_at) {
+      const inbound=[...(lead.conversation||[])].reverse().find(m=>m.role==='user');
+      await markExistingCollaboration(userId,jid,inbound?.content,inbound?.eventId);
+    }
+    return;
+  }
   if (noAction || !replyText) {
     console.warn(`⏹️  ${jid}: no hay nada que contestar — no se manda ni se cierra nada.`);
     await upsertLeadPatch(userId, jid, { negotiation });
@@ -620,13 +629,18 @@ export async function sweepTimers(sock, userId) {
       }
 
       const tiers = await getPricingTiers(userId);
-      const { replyText, noAction, closed, closedPrice, closedVideos, negotiation } = await getNextMove(
+      const { replyText, noAction, existingCollaboration, closed, closedPrice, closedVideos, negotiation } = await getNextMove(
         lead.conversation,
         tiers,
         lead.negotiation || null,
         { forceAccept: true }
       );
 
+      if(existingCollaboration) {
+        const inbound=[...(lead.conversation||[])].reverse().find(m=>m.role==='user');
+        await markExistingCollaboration(userId,lead.jid,inbound?.content,inbound?.eventId);
+        continue;
+      }
       // No había ninguna oferta real de la marca guardada — no se inventa nada.
       // Se deja el lead tal cual para revisarlo a mano.
       if (noAction || !replyText) {

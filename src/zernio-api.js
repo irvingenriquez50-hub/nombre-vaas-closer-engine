@@ -1,5 +1,5 @@
 export class ProviderError extends Error {
-  constructor(status, code, message) { super(message); this.status = status; this.code = code; }
+  constructor(status, code, message,providerCode=null) { super(message); this.status = status; this.code = code; this.providerCode=providerCode; }
 }
 export function createZernioClient({ key, fetchImpl = fetch } = {}) {
   return async (path, { method = 'GET', body, idempotencyKey } = {}) => {
@@ -15,7 +15,7 @@ export function createZernioClient({ key, fetchImpl = fetch } = {}) {
     const data = await res.json().catch(() => null);
     if (!res.ok || !data || data.success === false) {
       throw new ProviderError(res.ok ? 502 : res.status, data?.code || 'provider_error',
-        `Zernio no completó la operación (${data?.code || res.status}).`);
+        `Zernio no completó la operación (${data?.code || res.status}).`,data?.platformError?.error?.code||data?.platformError?.code||null);
     }
     return data;
   };

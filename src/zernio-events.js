@@ -4,6 +4,8 @@ import { canonicalPhone, isHumanMessage, validPhone } from './zernio-policy.js';
 import { handleInboundMessage } from './queue.js';
 import { sendMessage } from './sessions.js';
 import { addLead, appendMessage } from './state.js';
+import {existingCollaborationSignal,deliveryReviewReason} from './outreach-policy.js';
+import {reviewContact,markExistingCollaboration} from './contact-review.js';
 
 export async function acceptEvent(event) {
   if(event.test || event.event==='webhook.test') return;
@@ -25,15 +27,16 @@ export async function processEvent(e) {
   const number=validPhone(rawNumber)?canonicalPhone(rawNumber):'';
   let lead=link ? await db(supabase.from('leads').select('*').eq('user_id',c.user_id).eq('jid',link.jid).maybeSingle()) : null;
   if(!lead && validPhone(number)) lead=await db(supabase.from('leads').select('*').eq('user_id',c.user_id).eq('jid',number).maybeSingle());
-  if(!lead && e.event==='message.received' && validPhone(number)) lead=(await addLead(c.user_id,number)).lead;
+  const previouslyKnown=!!lead;
+  if(!lead && (e.event==='message.received'||isHumanMessage(e)) && validPhone(number)) lead=(await addLead(c.user_id,number)).lead;
   if(!lead) return;
   if(!link) await db(supabase.from('zernio_conversations').upsert({user_id:c.user_id,account_id:accountId,conversation_id:msg.conversationId,jid:lead.jid},{onConflict:'user_id,account_id,jid'}));
   if(isHumanMessage(e)) {
     await appendMessage(c.user_id,lead.jid,'assistant',msg.text || '[Mensaje desde WhatsApp]',{eventId:e.id,at:msg.sentAt});
-    await db(supabase.from('leads').update({paused:true,last_error:'Tomaste la conversación desde WhatsApp. Reanuda el bot cuando quieras.'}).eq('id',lead.id)); return;
+    await reviewContact(c.user_id,lead.phone,'Tomaste la conversación desde WhatsApp. Revisa antes de volver a activar el bot.','whatsapp'); return;
   }
   if(e.event==='message.failed') {
-    await db(supabase.from('leads').update({last_error:'WhatsApp rechazó un envío. Revisa la entrega antes de reanudar.',paused:true}).eq('id',lead.id)); return;
+    await reviewContact(c.user_id,lead.phone,deliveryReviewReason(e.error || msg.error || e.failure || 'WhatsApp rechazó un envío.')); return;
   }
   if(e.event!=='message.received' || msg.direction!=='incoming') return;
   const text=msg.text || '[Archivo recibido; requiere revisión de una persona]';
@@ -44,7 +47,14 @@ export async function processEvent(e) {
     await db(supabase.from('leads').update({paused:true,last_error:stop?'El contacto pidió dejar de recibir mensajes.':'Una persona debe revisar esta conversación.',
       ...(stop?{negotiation:{...(lead.negotiation||{}),optedOut:true}}:{})}).eq('id',lead.id)); return;
   }
-  if(lead.status==='nuevo') await db(supabase.from('leads').update({status:'negociando'}).eq('id',lead.id));
+  const signal=existingCollaborationSignal(text);
+  if(signal==='confirmed') {await markExistingCollaboration(c.user_id,lead.jid,text,e.id);return;}
+  if(signal==='review') {await reviewContact(c.user_id,lead.phone,'La respuesta necesita revisión. El bot se detuvo sin contestar.','whatsapp');return;}
+  const contact=await db(supabase.from('closer_contacts').select('state').eq('user_id',c.user_id).eq('phone',canonicalPhone(lead.phone)).maybeSingle());
+  if(!previouslyKnown || ['queued','review'].includes(contact?.state) || lead.status==='nuevo') {
+    await reviewContact(c.user_id,lead.phone,'Ya hay una conversación en tu WhatsApp. Revisa antes de escribir.','whatsapp');return;
+  }
+  if(['blocked','skipped','collaborated'].includes(contact?.state) || lead.paused || lead.status==='cerrado') return;
   await handleInboundMessage({sendMessage:(jid,body)=>sendMessage(c.user_id,jid,body.text,body.expected)},c.user_id,lead.jid,text,{recorded:true});
 }
 let running=false;

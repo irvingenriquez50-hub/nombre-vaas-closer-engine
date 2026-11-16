@@ -19,6 +19,7 @@ const {processEvent}=await import('../src/zernio-events.js');
 const {digest}=await import('../src/zernio-policy.js');
 const {getNextMove}=await import('../src/negotiate.js');
 const {syncContacts,prepareNextContact,restrictedMarketing}=await import('../src/autopilot.js');
+const {drainTrackerReviews}=await import('../src/tracker-reviews.js');
 const u='11111111-1111-4111-8111-111111111111',v='22222222-2222-4222-8222-222222222222';
 
 // In-memory PostgREST boundary; actual SQL and permissions are tested separately in migration.test.js.
@@ -28,6 +29,7 @@ function fakeDb(tables){
     const q={
       select(){return q;},eq(k,val){filters.push(r=>r[k]===val);return q;},is(k,val){filters.push(r=>r[k]==val);return q;},
       gt(k,val){filters.push(r=>r[k]>val);return q;},gte(k,val){filters.push(r=>r[k]>=val);return q;},
+      lte(k,val){filters.push(r=>r[k]<=val);return q;},
       in(k,vals){filters.push(r=>vals.includes(r[k]));return q;},neq(k,val){filters.push(r=>r[k]!==val);return q;},
       maybeSingle(){single=true;return q;},single(){single=true;return q;},
       insert(value){operation='insert';body=value;return q;},upsert(value,opts={}){operation='upsert';body=value;options=opts;return q;},
@@ -55,7 +57,7 @@ function fakeDb(tables){
 function fixture(){return {
   users:[{id:u,status:'active',expires_at:null},{id:v,status:'active',expires_at:null}],
   closer_settings:[{id:true,sends_enabled:true}],
-  closer_automation:[{user_id:u,consent_at:new Date().toISOString(),lookback_days:60}],
+  closer_automation:[{user_id:u,consent_at:new Date().toISOString(),lookback_days:30}],
   closer_contacts:[{user_id:u,phone:'8613800138000',state:'active'}],
   zernio_connections:[{user_id:u,profile_id:'profile1',account_id:'aaaaaaaaaaaaaaaaaaaaaaaa',connected:true,bot_enabled:true,templates_ready:true,health_checked_at:new Date().toISOString(),opening_template:'vaas_opening_message',followup_template:'vaas_followup_message',template_language:'en'}],
   leads:[{id:'lead1',user_id:u,jid:'8613800138000',phone:'8613800138000',status:'negociando',paused:false,last_inbound_at:new Date(Date.now()-10000).toISOString(),last_outbound_at:null,conversation:[]}],
@@ -93,10 +95,12 @@ test('paused, expired and human-controlled accounts never call the provider',asy
 });
 test('ambiguous provider failure pauses the contact and cannot be blindly retried',async()=>{
   const tables=fixture();let calls=0;mock.method(supabase,'from',fakeDb(tables));
+  const reviews=[];mock.method(supabase,'rpc',async(name,args)=>{reviews.push({name,args});return {data:null,error:null};});
   mock.method(globalThis,'fetch',async()=>{calls++;throw Error('timeout');});
   try{
     await assert.rejects(()=>sendZernio(u,'8613800138000','text','hello'));
     assert.equal(tables.zernio_outbound[0].state,'unknown');assert.equal(tables.leads[0].paused,true);
+    assert.equal(reviews[0].name,'closer_review_contact');assert.equal(reviews[0].args.p_user,u);
     tables.leads[0].paused=false;
     await assert.rejects(()=>sendZernio(u,'8613800138000','text','hello'));
     assert.equal(calls,1);
@@ -121,11 +125,11 @@ test('callback cannot bind an account from another profile or reuse another user
   }finally{mock.restoreAll();}
 });
 test('human messages pause only their own conversation; unknown accounts are ignored',async()=>{
-  const tables=fixture();mock.method(supabase,'from',fakeDb(tables));mock.method(supabase,'rpc',async()=>({data:{},error:null}));
+  const tables=fixture(),rpc=[];mock.method(supabase,'from',fakeDb(tables));mock.method(supabase,'rpc',async(name,args)=>{rpc.push({name,args});return {data:{},error:null};});
   const event={id:'human1',event:'message.sent',account:{accountId:'aaaaaaaaaaaaaaaaaaaaaaaa'},conversation:{participantId:'8613800138000'},message:{id:'m1',conversationId:'conv1',platform:'whatsapp',direction:'outgoing',source:'whatsapp_business_app',text:'I will handle this',sentAt:new Date().toISOString()}};
   try{
     await processEvent({...event,account:{accountId:'not-ours'}});assert.equal(tables.leads[0].paused,false);
-    await processEvent(event);assert.equal(tables.leads[0].paused,true);
+    await processEvent(event);assert.equal(rpc.length,2);assert.equal(rpc[1].name,'closer_review_contact');assert.equal(rpc[1].args.p_user,u);assert.equal(rpc[1].args.p_history,'whatsapp');
   }finally{mock.restoreAll();}
 });
 test('a recorded inbound event is not appended twice or given a new service-window timestamp',async()=>{
@@ -208,4 +212,55 @@ test('warmer negotiating reply retains the guardrail and strips AI-style typogra
   {videos:5,lastOffer:1500,midRounds:0},{creator:{short_name:'Demo'},readBrand:async()=>({videos:5,theirOffer:800}),brain:async p=>{prompt=p;return 'Having the script helps — I can come down to $1400 for five videos. I still need to prepare the delivery and film the takes so the videos feel natural.';}});
  assert.equal(result.closed,false);assert.equal(result.negotiation.lastOffer,1400);assert.doesNotMatch(result.replyText,/[—–]/);
  assert.match(prompt,/do not charge for writing a script they supply/);assert.match(prompt,/Never claim a paid editor/);assert.match(prompt,/LOWEST number you may state is \$1300/);
+});
+
+test('later history scans reconcile archived conversations already waiting in the queue',async()=>{
+ const tables=fixture();tables.closer_contacts=[{user_id:u,phone:'8613700138000',source_at:new Date(Date.now()-5*86400000).toISOString(),state:'queued'}];
+ mock.method(supabase,'from',fakeDb(tables));mock.method(supabase,'rpc',async()=>({data:true,error:null}));
+ mock.method(globalThis,'fetch',async(url)=>Response.json(String(url).includes('/api/internal/')?{ok:true,contacts:[]}:{data:[{id:'archived-chat',platform:'whatsapp',accountId:'aaaaaaaaaaaaaaaaaaaaaaaa',participantId:'8613700138000',businessScopedUserId:'opaque-id',status:'archived'}],pagination:{hasMore:false},meta:{accountsQueried:1,accountsFailed:0}}));
+ try{await syncContacts(u,{force:true});assert.equal(tables.closer_contacts[0].state,'review');assert.equal(tables.closer_contacts[0].history_source,'whatsapp');}finally{mock.restoreAll();}
+});
+
+test('inbound collaboration and failed-delivery events stop before any outgoing reply',async()=>{
+ const tables=fixture(),calls=[];mock.method(supabase,'from',fakeDb(tables));
+ mock.method(supabase,'rpc',async(name,args)=>{calls.push({name,args});return {data:{},error:null};});
+ mock.method(globalThis,'fetch',async()=>{throw Error('Must not send');});
+ const event={id:'collab-event',event:'message.received',account:{accountId:'aaaaaaaaaaaaaaaaaaaaaaaa'},message:{id:'message1',conversationId:'conv1',platform:'whatsapp',direction:'incoming',sender:{phoneNumber:'8613800138000'},text:'We already have a collaboration',sentAt:new Date().toISOString()}};
+ try{
+  await processEvent(event);assert.equal(calls.at(-1).name,'closer_existing_collaboration');assert.equal(calls.at(-1).args.p_user,u);
+  await processEvent({...event,id:'failed-event',event:'message.failed',error:{code:131049},conversation:{participantId:'8613800138000'},message:{...event.message,direction:'outgoing'}});
+  assert.equal(calls.at(-1).name,'closer_review_contact');assert.match(calls.at(-1).args.p_reason,/no se reintentará/);
+ }finally{mock.restoreAll();}
+});
+
+test('new unsolicited conversations are held for review rather than answered automatically',async()=>{
+ const tables=fixture(),calls=[];tables.leads=[];tables.zernio_conversations=[];
+ mock.method(supabase,'from',fakeDb(tables));mock.method(supabase,'rpc',async(name,args)=>{calls.push({name,args});return {data:{},error:null};});
+ try{
+  await processEvent({id:'old-thread',event:'message.received',account:{accountId:'aaaaaaaaaaaaaaaaaaaaaaaa'},message:{id:'old-message',conversationId:'newly-synced',platform:'whatsapp',direction:'incoming',sender:{phoneNumber:'8613700138000'},text:'Hi again',sentAt:new Date().toISOString()}});
+  assert.equal(calls.at(-1).name,'closer_review_contact');assert.equal(calls.at(-1).args.p_history,'whatsapp');
+ }finally{mock.restoreAll();}
+});
+
+test('recipient marketing limits are retained as a review reason',async()=>{
+ const tables=fixture(),calls=[];mock.method(supabase,'from',fakeDb(tables));mock.method(supabase,'rpc',async(name,args)=>{calls.push({name,args});return {data:true,error:null};});
+ mock.method(globalThis,'fetch',async()=>Response.json({code:'platform_api_error',platformError:{code:131049}},{status:400}));
+ try{
+  await assert.rejects(()=>sendZernio(u,'8613800138000','opening',['demo']));
+  assert.equal(tables.zernio_outbound[0].state,'rejected');assert.equal(tables.leads[0].paused,true);
+  assert.equal(calls.at(-1).name,'closer_review_contact');assert.match(calls.at(-1).args.p_reason,/limitó/);
+ }finally{mock.restoreAll();}
+});
+
+test('tracker delivery survives a failure with a stable review identity and no invented price',async()=>{
+ const tables=fixture(),bodies=[];tables.users[0].email='member@example.test';
+ tables.closer_tracker_reviews=[{id:'33333333-3333-4333-8333-333333333333',user_id:u,lead_id:'lead1',phone:'8613800138000',evidence:'Already collaborating',sent_at:null,attempts:0,next_attempt_at:'2000-01-01'}];
+ process.env.CLOSED_DEAL_WEBHOOK_URL='https://tracker.example.test/api/bot-webhook';process.env.CLOSED_DEAL_WEBHOOK_SECRET='test-secret';
+ mock.method(supabase,'from',fakeDb(tables));mock.method(supabase,'rpc',async()=>({data:true,error:null}));
+ mock.method(globalThis,'fetch',async(url,opts)=>{bodies.push(JSON.parse(opts.body));return Response.json({ok:bodies.length>1},{status:bodies.length>1?200:503});});
+ try{
+  await drainTrackerReviews();assert.equal(tables.closer_tracker_reviews[0].sent_at,null);assert.equal(tables.closer_tracker_reviews[0].attempts,1);
+  tables.closer_tracker_reviews[0].next_attempt_at='2000-01-01';await drainTrackerReviews();
+  assert.ok(tables.closer_tracker_reviews[0].sent_at);assert.equal(bodies[0].eventKey,bodies[1].eventKey);assert.equal(bodies[0].price,undefined);assert.equal(bodies[0].videos,undefined);
+ }finally{mock.restoreAll();}
 });

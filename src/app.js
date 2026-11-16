@@ -6,6 +6,7 @@ import { acceptEvent } from './zernio-events.js';
 import { startProcessForNumber } from './queue.js';
 import { sendMessage } from './sessions.js';
 import {automationStatus,saveAutomation,syncContacts,decideContact,manageLead} from './autopilot.js';
+import {contactCutoff} from './outreach-policy.js';
 
 const asyncRoute = fn => (req,res,next) => Promise.resolve(fn(req,res,next)).catch(next);
 export function createApp() {
@@ -61,7 +62,9 @@ export function createApp() {
     if(failedEvents.error || uncertainSends.error) throw new Error('No se pudo revisar el estado de los envíos.');
     const automationCounts={};
     for(const state of ['queued','review','active','collaborated']) {
-      const result=await supabase.from('closer_contacts').select('phone',{count:'exact',head:true}).eq('state',state);
+      const since=new Date(contactCutoff()).toISOString();
+      const result=await supabase.from('closer_contacts').select('phone',{count:'exact',head:true}).eq('state',state)
+       .or(`source_at.gte.${since},and(source_at.is.null,first_seen_at.gte.${since})`);
       if(result.error) throw new Error('No se pudo revisar la cola automática.');
       automationCounts[state]=result.count;
     }

@@ -4,7 +4,8 @@ import {supabase} from './supabase.js';
 import {db,connection,member} from './zernio-control.js';
 import {activeMembership,canonicalPhone,validPhone} from './zernio-policy.js';
 import {zernio} from './zernio-api.js';
-import {compactContacts,ownHistory,hold} from './outreach-policy.js';
+import {compactContacts,ownHistory,hold,CONTACT_DAYS,contactCutoff,visibleContact,historyPhone,deliveryReviewReason} from './outreach-policy.js';
+import {reviewContact} from './contact-review.js';
 
 export async function withLease(scope,fn,{seconds=600,busy=null}={}) {
  const owner=randomUUID();
@@ -14,7 +15,7 @@ export async function withLease(scope,fn,{seconds=600,busy=null}={}) {
 export async function allRows(table,userId,columns='*') {
  const rows=[];
  for(let offset=0;;offset+=500) {
-  const page=await db(supabase.from(table).select(columns).eq('user_id',userId).order(table==='closer_contacts'?'phone':'id').range(offset,offset+499));
+  const page=await db(supabase.from(table).select(columns).eq('user_id',userId).order(table==='closer_contacts'?'phone':table==='zernio_conversations'?'jid':'id').range(offset,offset+499));
   rows.push(...page); if(page.length<500) return rows;
   if(offset>=49500) throw new Error('Demasiados contactos para sincronizar de una vez. Requiere revisión.');
  }
@@ -24,7 +25,7 @@ export async function automation(userId) {
  return db(supabase.from('closer_automation').select('*').eq('user_id',userId).single());
 }
 export async function saveAutomation(userId,actorId,body) {
- if(![30,60].includes(body.lookbackDays) || typeof body.consent!=='boolean') throw new Error('Selecciona 30 o 60 días y confirma el permiso de contacto.');
+ if(body.lookbackDays!==CONTACT_DAYS || typeof body.consent!=='boolean') throw new Error('La lista usa los últimos 30 días. Confirma el permiso de contacto.');
  const old=await automation(userId);
  await db(supabase.from('closer_automation').update({lookback_days:body.lookbackDays,
   consent_at:body.consent?(old.consent_at||new Date().toISOString()):null,consent_actor:body.consent?actorId:null,
@@ -33,7 +34,7 @@ export async function saveAutomation(userId,actorId,body) {
 }
 export function restrictedMarketing(phone) {return parsePhoneNumberFromString('+'+phone)?.country==='US';}
 
-async function providerHistory(c) {
+async function providerHistory(c,links) {
  const phones=new Set(); let cursor;
  for(let page=0;page<30;page++) {
   const qs=new URLSearchParams({platform:'whatsapp',accountId:c.account_id,profileId:c.profile_id,limit:'100'});
@@ -43,7 +44,8 @@ async function providerHistory(c) {
   for(const row of result.data) {
    const account=typeof row.accountId==='object'?row.accountId?._id:row.accountId;
    if(account!==c.account_id || row.platform!=='whatsapp') throw new Error('El historial no corresponde a tu conexión.');
-   if(!row.businessScopedUserId && validPhone(row.participantId)) phones.add(canonicalPhone(row.participantId));
+   const phone=historyPhone({...row,accountId:account},links);
+   if(phone) phones.add(phone);
   }
   if(!result.pagination?.hasMore) return phones;
   if(!result.pagination.nextCursor || result.pagination.nextCursor===cursor) break;
@@ -60,39 +62,52 @@ export async function syncContacts(userId,{force=false}={}) {
   const needsHistory=c?.connected && (!a.history_checked_at || a.history_account_id!==c.account_id);
   if(!force && !needsHistory && a.last_sync_at && Date.now()-Date.parse(a.last_sync_at)<15*60000) return {synced:false};
   try {
-   const now=Date.now(),since=now-a.lookback_days*86400000;
+   const now=Date.now(),since=contactCutoff(now);
    if(!process.env.CLOSER_SYNC_SECRET || !process.env.APP_URL) throw new Error('Falta configurar la importación automática.');
    const url=new URL('/api/internal/closer-contacts',process.env.APP_URL);
-   url.searchParams.set('days',String(a.lookback_days));
+   url.searchParams.set('days',String(CONTACT_DAYS));
    if(a.last_sync_at) url.searchParams.set('since',new Date(Math.max(since,Date.parse(a.last_sync_at)-86400000)).toISOString());
    const response=await fetch(url,{headers:{'x-closer-sync':process.env.CLOSER_SYNC_SECRET},signal:AbortSignal.timeout(40000)});
    if(!response.ok) throw new Error('No se pudo importar la lista. Se volverá a intentar automáticamente.');
    const source=await response.json();
    if(!source.ok || !Array.isArray(source.contacts)) throw new Error('La lista de contactos no está disponible.');
-   const [leads,deals,outbound,existing]=await Promise.all([
-    allRows('leads',userId,'id,phone,jid,status,paused,negotiation,last_inbound_at,last_outbound_at'),allRows('closed_deals',userId,'id,phone'),allRows('zernio_outbound',userId,'id,lead_id,state'),allRows('closer_contacts',userId)]);
+   const [leads,deals,outbound,existing,links]=await Promise.all([
+    allRows('leads',userId,'id,phone,jid,status,paused,negotiation,last_inbound_at,last_outbound_at,last_error'),allRows('closed_deals',userId,'id,phone'),allRows('zernio_outbound',userId,'id,lead_id,state'),allRows('closer_contacts',userId),
+    allRows('zernio_conversations',userId,'account_id,conversation_id,jid')]);
    const own=new Map(leads.map(l=>[canonicalPhone(l.phone),l]));
    const closed=new Set(deals.map(d=>canonicalPhone(d.phone)));
    const attempts=new Set(outbound.map(o=>o.lead_id));
    const prior=new Map(existing.map(x=>[x.phone,x]));
    // Preview may import without a connection; sending requires a successful account-scoped scan.
-   const history=c?.connected?await providerHistory(c):new Set();
+   const history=c?.connected?await providerHistory(c,links):new Set();
    let count=0;const additions=[];
-   for(const row of compactContacts(source.contacts,since,now)) {
+   const incoming=compactContacts(source.contacts,since,now);
+   // Reconcile every eligible queued contact, even when the source import is incremental.
+   // A later history sync must catch older queue entries, not just today's new rows.
+   const candidates=new Map(existing.filter(r=>visibleContact(r,now)).map(r=>[r.phone,r]));
+   for(const row of incoming) {
+    const old=prior.get(row.phone);
+    if(old && (!old.source_at || row.source_at>old.source_at)) {
+     await db(supabase.from('closer_contacts').update(row).eq('user_id',userId).eq('phone',row.phone));
+     Object.assign(old,row);
+    }
+    candidates.set(row.phone,row);
+   }
+   for(const row of candidates.values()) {
     const previous=prior.get(row.phone),lead=own.get(row.phone);
     let state=ownHistory(lead,closed.has(row.phone),attempts.has(lead?.id),history.has(row.phone));
-    let reason=state==='review'?'Tienes historial con este contacto. Revisa antes de escribir.':null;
+    let reason=state==='review'?(lead?.last_error?deliveryReviewReason(lead.last_error):'Tienes historial con este contacto. Revisa antes de escribir.'):null;
+    if(history.has(row.phone)) reason='Ya hay una conversación en tu WhatsApp. Revisa antes de escribir.';
     if(restrictedMarketing(row.phone) && state==='queued') {state='review';reason='WhatsApp limita las plantillas de marketing a números de EE. UU. Abre WhatsApp para revisar.';}
     if(previous) {
      if(previous.state==='active' && lead?.status==='nuevo' && history.has(row.phone) && !previous.reviewed_at) {
-      await db(supabase.from('closer_contacts').update({state:'review',reason:'Apareció una conversación antes del primer mensaje. Revisa WhatsApp.'}).eq('user_id',userId).eq('phone',row.phone).eq('state','active'));
-      await db(supabase.from('leads').update({paused:true}).eq('id',lead.id).eq('status','nuevo'));
+      await reviewContact(userId,row.phone,'Apareció una conversación antes del primer mensaje. Revisa WhatsApp.','whatsapp');
       continue;
      }
      // Never resurrect a member decision or overwrite an active conversation during imports.
      if(previous.state!=='queued') continue;
      if(state==='queued') continue;
-     await db(supabase.from('closer_contacts').update({state,reason}).eq('user_id',userId).eq('phone',row.phone).eq('state','queued'));
+     await db(supabase.from('closer_contacts').update({state,reason,history_source:history.has(row.phone)?'whatsapp':'closer'}).eq('user_id',userId).eq('phone',row.phone).eq('state','queued'));
     } else {
      additions.push({...row,user_id:userId,state,reason,
       history_source:history.has(row.phone)?'whatsapp':lead||closed.has(row.phone)?'closer':null});
@@ -113,7 +128,7 @@ export async function prepareNextContact(userId) {
  const [a,c]=await Promise.all([automation(userId),connection(userId)]);
  if(!a.consent_at || !a.history_checked_at || a.history_account_id!==c?.account_id || a.last_error || Date.now()-Date.parse(a.history_checked_at)>30*60000) return;
  const rows=await db(supabase.from('closer_contacts').select('*').eq('user_id',userId).eq('state','queued')
-  .gte('source_at',new Date(Date.now()-a.lookback_days*86400000).toISOString()).order('source_at').limit(1));
+  .gte('source_at',new Date(contactCutoff()).toISOString()).order('source_at').limit(1));
  for(const row of rows) await withLease('lead:'+userId+':'+row.phone,async()=>{
   const existing=await db(supabase.from('leads').select('*').eq('user_id',userId).eq('jid',row.phone).maybeSingle());
   if(existing) {
@@ -132,6 +147,7 @@ export async function assertOutreach(userId,lead,kind) {
  if(item && ['blocked','skipped','collaborated','review'].includes(item.state)) throw hold('Revisa este contacto antes de enviar.');
  if(kind==='opening' && (!item || item.state!=='active')) throw hold('Confirma este primer mensaje en Contactos.');
  if(kind==='opening' && item?.source_id && !item.reviewed_at) {
+  if(!visibleContact(item)) throw hold('Este contacto ya está fuera de los últimos 30 días.');
   const c=await connection(userId);
   if(a.last_error || !a.history_checked_at || a.history_account_id!==c?.account_id || Date.now()-Date.parse(a.history_checked_at)>30*60000) throw hold('Espera a que termine la revisión de tu historial.');
  }
@@ -158,14 +174,14 @@ export async function manageLead(userId,leadId,action) {
 }
 export async function automationStatus(userId) {
  const a=await automation(userId);
- const contacts=await allRows('closer_contacts',userId);
+ const contacts=(await allRows('closer_contacts',userId)).filter(r=>visibleContact(r));
  const leads=await allRows('leads',userId,'id,phone,status,paused,last_outbound_at,last_inbound_at,last_error');
  const byPhone=new Map(leads.map(l=>[canonicalPhone(l.phone),l]));
  const counts={queued:0,review:0,active:0,skipped:0,collaborated:0,blocked:0,sentToday:0};
  for(const row of contacts) counts[row.state]++;
  const today=new Date().toISOString().slice(0,10);
  for(const l of leads) if(l.last_outbound_at?.startsWith(today)) counts.sentToday++;
- return {settings:{lookbackDays:a.lookback_days,consent:!!a.consent_at,lastSync:a.last_sync_at,error:a.last_error,historyChecked:!!a.history_checked_at},counts,
+ return {settings:{lookbackDays:CONTACT_DAYS,consent:!!a.consent_at,lastSync:a.last_sync_at,error:a.last_error,historyChecked:!!a.history_checked_at},counts,
   contacts:contacts.sort((x,y)=>(y.source_at||'').localeCompare(x.source_at||'')).map(row=>({...row,lead:byPhone.get(row.phone)||null})),
   cadenceSeconds:60,replyMinutes:Number(process.env.REPLY_DEBOUNCE_MINUTES||5)};
 }

@@ -4,7 +4,8 @@ import { zernio } from './zernio-api.js';
 import { db, assertCanSend } from './zernio-control.js';
 import { actionKey, canonicalPhone, serviceWindowOpen } from './zernio-policy.js';
 import {assertOutreach} from './autopilot.js';
-import {hold} from './outreach-policy.js';
+import {hold,deliveryReviewReason} from './outreach-policy.js';
+import {reviewContact} from './contact-review.js';
 
 export async function sendZernio(userId, jid, kind, textOrParams, expected=null, intent='reply') {
   const c = await assertCanSend(userId);
@@ -63,6 +64,7 @@ export async function sendZernio(userId, jid, kind, textOrParams, expected=null,
     // A timeout/5xx can mean Meta accepted it. Never blindly retry an ambiguous send.
     await db(supabase.from('zernio_outbound').update({state:error.status>=400 && error.status<500?'rejected':'unknown',last_error:error.message}).eq('id',id));
     await db(supabase.from('leads').update({paused:true,last_error:error.message}).eq('id',lead.id));
+    await reviewContact(userId,lead.phone,deliveryReviewReason(error));
     throw error;
   }
 }

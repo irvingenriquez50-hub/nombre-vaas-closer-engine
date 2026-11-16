@@ -23,6 +23,9 @@ test('durable pacing, tenant isolation, decisions and opt-outs survive retries',
   await pg.exec(`insert into closer_automation(user_id,consent_at) values('${u}',now());
    insert into closer_contacts(user_id,phone,state) values('${u}','8613800138000','review'),('${v}','8613800138000','blocked');
    insert into leads(user_id,phone,jid,negotiation,conversation) values('${u}','8613800138000','8613800138000','{}','[{"role":"assistant","content":"old"}]');`);
+  await pg.exec(await readFile(new URL('../supabase/migrations/20261116080502_closer_review_and_30_days.sql',import.meta.url),'utf8'));
+  assert.equal((await pg.query('select lookback_days from closer_automation')).rows[0].lookback_days,30);
+  await assert.rejects(()=>pg.exec('update closer_automation set lookback_days=60'));
   const before=(await pg.query('select * from leads')).rows[0];
   await pg.query("select closer_contact_decide($1,'8613800138000','send')",[u]);
   let after=(await pg.query('select * from leads')).rows[0];
@@ -37,9 +40,22 @@ test('durable pacing, tenant isolation, decisions and opt-outs survive retries',
   await assert.rejects(()=>pg.query("select closer_contact_decide($1,'8613800138000','send')",[u]));
   assert.equal((await pg.query("select closer_claim_lease('sync:a',$1,600) as claimed",[u])).rows[0].claimed,true);
   assert.equal((await pg.query("select closer_claim_lease('sync:a',$1,600) as claimed",[v])).rows[0].claimed,false);
+  await pg.exec(`insert into leads(user_id,phone,jid,status) values('${u}','8613900138000','8613900138000','negociando');`);
+  await pg.query("select closer_review_contact($1,'8613900138000','WhatsApp refused','whatsapp')",[u]);
+  assert.equal((await pg.query("select paused from leads where jid='8613900138000'")).rows[0].paused,true);
+  assert.equal((await pg.query("select state from closer_contacts where phone='8613900138000'")).rows[0].state,'review');
+  for(let i=0;i<2;i++) await pg.query("select closer_existing_collaboration($1,'8613900138000','We already have a collaboration','event1')",[u]);
+  const collaboration=(await pg.query("select * from leads where jid='8613900138000'")).rows[0];
+  assert.equal(collaboration.paused,true);assert.equal(collaboration.negotiation.manualCollab,true);assert.equal(collaboration.status,'dormant');
+  assert.equal((await pg.query('select * from closer_tracker_reviews')).rows.length,1);
+  await pg.query("select closer_review_contact($1,'8613900138000','late failure',null)",[u]);
+  assert.equal((await pg.query("select state from closer_contacts where phone='8613900138000'")).rows[0].state,'collaborated');
+  assert.equal((await pg.query('select state from closer_contacts where user_id=$1',[v])).rows[0].state,'blocked');
   await pg.exec('set role authenticated');
   await assert.rejects(()=>pg.query('select * from closer_contacts'));
   await assert.rejects(()=>pg.query("select closer_claim_outreach('account-c')"));
   await assert.rejects(()=>pg.query('delete from leads'));
+  await assert.rejects(()=>pg.query('select * from closer_tracker_reviews'));
+  await assert.rejects(()=>pg.query("select closer_review_contact($1,'8613900138000','bad',null)",[u]));
  }finally{await pg.close();}
 });

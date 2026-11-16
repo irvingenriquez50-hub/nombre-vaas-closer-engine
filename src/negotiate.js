@@ -88,6 +88,7 @@ Return ONLY a JSON object — no preamble, no markdown fences — with exactly t
   "claimsFinal": true or false,
   "waitingOnThem": true or false,
   "wantsToEnd": true or false,
+  "existingCollaboration": true or false,
   "noBudgetForNow": true or false
 }
 
@@ -97,6 +98,7 @@ How to fill each key:
 - "claimsFinal": true if they frame their number as a maximum/final/best/hard cap, or use pressure framing like "I fought for you with my team".
 - "waitingOnThem": true if their latest message says THEY need to do something before continuing — "I'll submit your profile", "let me check with my team", "I'll get back to you", "waiting for approval" — with NO new offer and NO rejection.
 - "wantsToEnd": true if they are DEFINITIVELY ending or declining — "someone from my team is already talking to you", "let's not continue", "we already work with you", "not interested", a flat no, a final goodbye with no future opening.
+- "existingCollaboration": true ONLY when the brand says it ALREADY has an agreed, ongoing, or completed collaboration with THIS creator, including natural paraphrases of "we already have a collaboration" or "we're already working together". Do not confuse a new proposal, a price counter, an unrelated creator, a negation, or a hypothetical question with an existing collaboration. This means STOP SILENTLY, not negotiate or say goodbye.
 - "noBudgetForNow": true ONLY if they say there is nothing/no budget/no campaign available RIGHT NOW **and** they leave the door open for later — "I'll let you know when something comes up", "I'll keep an eye out for other campaigns", "nothing right now but I'll reach out", "stay in touch". Both halves must be present: nothing now AND a future opening. A flat "no thanks" with no future opening is wantsToEnd, NOT this. If you are unsure which one it is, choose wantsToEnd and leave noBudgetForNow false.
 
 IMPORTANT: commission/affiliate percentages (e.g. "20% commission") are NEVER a price — never put them in "theirOffer".
@@ -128,6 +130,7 @@ async function readBrandMessage(conversation) {
       claimsFinal: !!parsed.claimsFinal,
       waitingOnThem: !!parsed.waitingOnThem,
       wantsToEnd: !!parsed.wantsToEnd,
+      existingCollaboration: parsed.existingCollaboration===true,
       noBudgetForNow: !!parsed.noBudgetForNow,
     };
   } catch (err) {
@@ -369,6 +372,7 @@ export async function getNextMove(conversation, tiers, negState = null, opts = {
 
   const r = await (opts.readBrand || readBrandMessage)(conversation);
   console.log(`🔎 Lectura: ${JSON.stringify(r)}`);
+  if(r.existingCollaboration===true) return {existingCollaboration:true,replyText:null,noAction:true,closed:false,negotiation:state};
 
   // Estado del lado de ELLOS
   const their = r.theirOffer != null && !Number.isNaN(r.theirOffer) ? Number(r.theirOffer) : null;
