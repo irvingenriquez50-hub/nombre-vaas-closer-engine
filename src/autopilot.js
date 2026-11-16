@@ -70,14 +70,14 @@ export async function syncContacts(userId,{force=false}={}) {
    const source=await response.json();
    if(!source.ok || !Array.isArray(source.contacts)) throw new Error('La lista de contactos no está disponible.');
    const [leads,deals,outbound,existing]=await Promise.all([
-    allRows('leads',userId),allRows('closed_deals',userId),allRows('zernio_outbound',userId,'id,lead_id,state'),allRows('closer_contacts',userId)]);
+    allRows('leads',userId,'id,phone,jid,status,paused,negotiation,last_inbound_at,last_outbound_at'),allRows('closed_deals',userId,'id,phone'),allRows('zernio_outbound',userId,'id,lead_id,state'),allRows('closer_contacts',userId)]);
    const own=new Map(leads.map(l=>[canonicalPhone(l.phone),l]));
    const closed=new Set(deals.map(d=>canonicalPhone(d.phone)));
    const attempts=new Set(outbound.map(o=>o.lead_id));
    const prior=new Map(existing.map(x=>[x.phone,x]));
    // Preview may import without a connection; sending requires a successful account-scoped scan.
    const history=c?.connected?await providerHistory(c):new Set();
-   let count=0;
+   let count=0;const additions=[];
    for(const row of compactContacts(source.contacts,since,now)) {
     const previous=prior.get(row.phone),lead=own.get(row.phone);
     let state=ownHistory(lead,closed.has(row.phone),attempts.has(lead?.id),history.has(row.phone));
@@ -94,11 +94,12 @@ export async function syncContacts(userId,{force=false}={}) {
      if(state==='queued') continue;
      await db(supabase.from('closer_contacts').update({state,reason}).eq('user_id',userId).eq('phone',row.phone).eq('state','queued'));
     } else {
-     await db(supabase.from('closer_contacts').upsert({...row,user_id:userId,state,reason,
-      history_source:history.has(row.phone)?'whatsapp':lead||closed.has(row.phone)?'closer':null},{onConflict:'user_id,phone',ignoreDuplicates:true}));
+     additions.push({...row,user_id:userId,state,reason,
+      history_source:history.has(row.phone)?'whatsapp':lead||closed.has(row.phone)?'closer':null});
      count++;
     }
    }
+   for(let offset=0;offset<additions.length;offset+=200) await db(supabase.from('closer_contacts').upsert(additions.slice(offset,offset+200),{onConflict:'user_id,phone',ignoreDuplicates:true}));
    await db(supabase.from('closer_automation').update({last_sync_at:new Date().toISOString(),last_error:null,
     history_checked_at:c?.connected?new Date().toISOString():null,history_account_id:c?.connected?c.account_id:null}).eq('user_id',userId));
    return {synced:true,imported:count};

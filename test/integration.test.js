@@ -37,10 +37,13 @@ function fakeDb(tables){
         let data=rows.filter(r=>filters.every(f=>f(r)));
         if(operation==='insert'||operation==='upsert'){
           const keys=(options.onConflict || 'id').split(',');
-          const existing=rows.find(r=>keys.every(k=>body[k]!=null&&r[k]===body[k]));
+          data=[];
+          for(const value of Array.isArray(body)?body:[body]) {
+          const existing=rows.find(r=>keys.every(k=>value[k]!=null&&r[k]===value[k]));
           if(existing && operation==='insert') return {data:null,error:{code:'23505'}};
-          if(existing){if(!options.ignoreDuplicates)Object.assign(existing,body);data=[existing];}
-          else {const row={...body};rows.push(row);data=[row];}
+          if(existing){if(!options.ignoreDuplicates)Object.assign(existing,value);data.push(existing);}
+          else {const row={...value};rows.push(row);data.push(row);}
+          }
         }else if(operation==='update'){data.forEach(r=>Object.assign(r,body));}
         else if(operation==='delete'){for(const row of data) rows.splice(rows.indexOf(row),1);}
         data=data.slice(start,end);
