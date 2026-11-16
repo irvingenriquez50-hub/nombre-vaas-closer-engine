@@ -1,3 +1,5 @@
+import {withLease} from './autopilot.js';
+import {deferred} from './outreach-policy.js';
 import {
   addLead,
   appendMessage,
@@ -31,7 +33,7 @@ const DEBOUNCE_MS = Number(process.env.REPLY_DEBOUNCE_SECONDS ?? (Number(process
 // Railway se reinicia (deploy, caída, actualización automática) durante esos
 // minutos de espera, el temporizador desaparece y ese mensaje se queda SIN
 // CONTESTAR PARA SIEMPRE. Estas dos constantes controlan el rescate.
-const RESCUE_AFTER_MINUTES = Number(process.env.RESCUE_REPLY_AFTER_MINUTES || 15);
+const RESCUE_AFTER_MINUTES = Math.max(DEBOUNCE_MS/60000,Number(process.env.RESCUE_REPLY_AFTER_MINUTES || DEBOUNCE_MS/60000));
 const MAX_RESCUE_TRIES = Number(process.env.MAX_RESCUE_TRIES || 3);
 
 // ═══ "DÉJAME CONFIRMAR CON LA MARCA" ═══
@@ -163,20 +165,25 @@ export async function startProcessForNumber(sock, userId, phoneRaw, { skipMessag
   return {duplicate:false,lead,queued:true};
 }
 
-async function resolveAndSend(sock, userId, jid) {
+async function resolveAndSend(sock,userId,jid) {
+  return withLease('lead:'+userId+':'+jid,()=>resolveAndSendLocked(sock,userId,jid));
+}
+async function resolveAndSendLocked(sock, userId, jid) {
   await assertCanSend(userId);
   const lead = await getLead(userId, jid);
   if (!lead || lead.status === "cerrado" || lead.paused) {
     console.log(`⚠️  resolveAndSend: no se contesta a ${jid} (status: ${lead?.status}, paused: ${lead?.paused})`);
     return;
   }
+  if(lead.last_outbound_at && Date.parse(lead.last_outbound_at)>=Date.parse(lead.last_inbound_at)) return;
 
   console.log(`🤖 Llamando a la IA para generar la respuesta a ${jid}...`);
   const tiers = await getPricingTiers(userId);
   const { replyText, noAction, closed, dormant, checkBack, closedPrice, closedVideos, negotiation } = await getNextMove(
     lead.conversation,
     tiers,
-    lead.negotiation || null
+    lead.negotiation || null,
+    {creator:await getScript(userId),contactSource:lead.negotiation?.contactSource}
   );
   console.log(`🤖 Respuesta final: "${replyText}" (closed: ${closed}, dormant: ${dormant}, checkBack: ${!!checkBack})`);
 
@@ -189,7 +196,9 @@ async function resolveAndSend(sock, userId, jid) {
   // Se manda PRIMERO. Si falla, no se marca nada como cerrado — así nunca queda
   // un trato "cerrado" en el sistema que la marca nunca recibió.
   if (closed && !safeClose(tiers, closedPrice, closedVideos)) throw new Error("El cierre no respeta el precio mínimo del paquete.");
-  await sock.sendMessage(jid, { text: replyText });
+  const latest=await getLead(userId,jid);
+  if(latest?.last_inbound_at!==lead.last_inbound_at || latest?.last_outbound_at!==lead.last_outbound_at || latest?.paused) return;
+  await sock.sendMessage(jid, { text: replyText,expected:lead });
   console.log(`📤 Mensaje enviado a ${jid}`);
   await appendMessage(userId, jid, "assistant", replyText);
 
@@ -335,6 +344,7 @@ async function retryDormantLeads(userId, coldSendsAllowed) {
       enviados += 1;
       console.log(`🌅 REINTENTO 30 DÍAS: ${lead.jid} despertó — se le mandó el escrito otra vez y arranca su ciclo de follow-ups. Es su única segunda vuelta.`);
     } catch (err) {
+      if(deferred(err)) continue;
       // Se marca igual para que un número muerto no se reintente en cada barrido.
       console.error(`❌ No se pudo despertar a ${lead.jid}: ${err.message} — se marca para no reintentarlo.`);
       try {
@@ -379,6 +389,7 @@ export async function sweepTimers(sock, userId) {
         await appendMessage(userId, lead.jid, "assistant", "[Opening template message sent]");
         await upsertLeadPatch(userId, lead.jid, { status: "escrito_enviado", last_outbound_at: new Date().toISOString() });
       } catch (err) {
+      if(deferred(err)) continue;
         // No se pudo entregar el mensaje 1. Se marca como fallido con el motivo
         // en vez de dejarlo en "nuevo" reintentando en cada barrido para siempre.
         // Sale en rojo en la Cola, con su botón de Reiniciar.
@@ -443,6 +454,7 @@ export async function sweepTimers(sock, userId) {
       try {
         await resolveAndSend(sock, userId, lead.jid);
       } catch (err) {
+      if(deferred(err)) continue;
         console.error(`❌ El rescate de ${lead.jid} falló: ${err.message}`);
       }
       continue;
@@ -476,13 +488,10 @@ export async function sweepTimers(sock, userId) {
         });
         console.log(`🔁 Seguimiento semanal ${done + 1}/${MAX_CHECKBACKS} mandado a ${lead.jid}.`);
       } catch (err) {
+      if(deferred(err)) continue;
         // El intento se cuenta aunque haya fallado, para no reintentar sin parar.
         console.error(`❌ No se pudo mandar el seguimiento semanal a ${lead.jid}: ${err.message} — el intento se cuenta igual.`);
-        await upsertLeadPatch(userId, lead.jid, {
-          negotiation: { ...neg, checkbackCount: done + 1 },
-          last_outbound_at: new Date().toISOString(),
-          last_error: err.message,
-        });
+        await upsertLeadPatch(userId, lead.jid, {paused:true,last_error:err.message});
       }
       continue;
     }
@@ -530,15 +539,11 @@ export async function sweepTimers(sock, userId) {
         });
         console.log(`🔔 Follow-up ${sent + 1}/4 mandado a ${lead.jid}`);
       } catch (err) {
+      if(deferred(err)) continue;
         // El intento se cuenta AUNQUE haya fallado. Sin esto, un número muerto se
         // reintentaría en cada barrido para siempre, quemando llamadas a Meta.
         console.error(`❌ No se pudo mandar el follow-up ${sent + 1}/4 a ${lead.jid}: ${err.message} — el intento se cuenta igual.`);
-        await upsertLeadPatch(userId, lead.jid, {
-          status: "followup",
-          followup_count: sent + 1,
-          last_outbound_at: new Date().toISOString(),
-          last_error: err.message,
-        });
+        await upsertLeadPatch(userId, lead.jid, {paused:true,last_error:err.message});
       }
       continue;
     }
@@ -567,7 +572,7 @@ export async function sweepTimers(sock, userId) {
         if (!insideWindow && !coldSendsAllowed) continue;
         try {
           if (insideWindow) {
-            await sock.sendMessage(lead.jid, { text: nudgeText });
+            await sock.sendMessage(lead.jid, { text: nudgeText,expected:lead,intent:'waiting_nudge:'+nudges });
           } else {
             await sendFollowupTemplate(userId, lead.jid);
           }
@@ -578,13 +583,10 @@ export async function sweepTimers(sock, userId) {
           });
           console.log(`⏲️  Día ${nudges + 1}/${MAX_WAITING_NUDGES} preguntando "any updates?" a ${lead.jid} — está confirmando con la marca${insideWindow ? "" : " (por template)"}.`);
         } catch (err) {
+      if(deferred(err)) continue;
           // El intento se cuenta aunque haya fallado, para no reintentar sin parar.
           console.error(`❌ No se pudo mandar el recordatorio a ${lead.jid}: ${err.message} — el intento se cuenta igual.`);
-          await upsertLeadPatch(userId, lead.jid, {
-            negotiation: { ...lead.negotiation, waitingNudges: nudges + 1 },
-            last_outbound_at: new Date().toISOString(),
-            last_error: err.message,
-          });
+          await upsertLeadPatch(userId, lead.jid, {paused:true,last_error:err.message});
         }
       }
       continue; // mientras confirman con la marca, NO aplica el cierre automático de 18h
@@ -640,8 +642,9 @@ export async function sweepTimers(sock, userId) {
       // así nunca queda un trato "cerrado" en el sistema que la marca nunca recibió.
       try {
         if (closed && !safeClose(tiers, closedPrice, closedVideos)) throw new Error("El cierre no respeta el precio mínimo del paquete.");
-        await sock.sendMessage(lead.jid, { text: replyText });
+        await sock.sendMessage(lead.jid, { text: replyText,expected:lead,intent:'auto_close' });
       } catch (err) {
+      if(deferred(err)) continue;
         console.error(`❌ ${lead.jid}: no se pudo mandar el cierre automático (${err.message}). NO se marca como cerrado.`);
         await upsertLeadPatch(userId, lead.jid, { negotiation, last_error: err.message });
         continue;
@@ -658,6 +661,7 @@ export async function sweepTimers(sock, userId) {
       }
     }
    } catch (err) {
+      if(deferred(err)) continue;
       console.error(`❌ Falló el barrido de ${lead.jid}: ${err.message} — se sigue con los demás contactos.`);
       try {
         await upsertLeadPatch(userId, lead.jid, { last_error: `Error del sistema: ${err.message}` });

@@ -26,8 +26,13 @@ export function serviceWindowOpen(lead, now = Date.now()) {
   const age = now - Date.parse(lead?.last_inbound_at);
   return Number.isFinite(age) && age >= 0 && age < 23.9 * 3600000;
 }
-export function actionKey(accountId, lead, kind) {
-  return digest(JSON.stringify([accountId, lead.id, kind, lead.last_inbound_at, lead.last_outbound_at, lead.followup_count, lead.dormant_followup_sent]));
+export function actionKey(accountId, lead, kind, intent='reply') {
+  const inbound=[...(lead.conversation||[])].reverse().find(m=>m.role==='user');
+  const inboundId=inbound?.eventId || inbound?.event_id || lead.last_inbound_at || null;
+  const phase=kind==='opening'?(lead.status==='dormant'?'retry30d':'initial'):
+    kind==='followup'?[inboundId,lead.status==='checkback'?'checkback':lead.negotiation?.waiting?'waiting':'opening_followup',
+      lead.followup_count||0,lead.negotiation?.checkbackCount||0,lead.negotiation?.waitingNudges||0]:[intent,inboundId];
+  return digest(JSON.stringify([accountId,lead.id,lead.outreach_cycle,kind,phase]));
 }
 export function safeClose(tiers, price, videos) {
   const tier = tiers.find(t => Number(t.videos) === Number(videos));
