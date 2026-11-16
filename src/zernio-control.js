@@ -146,7 +146,7 @@ export async function prepareTemplates(userId) {
   if(!profileReady(script,tiers || [])) throw new Error('Completa y guarda Tu escrito y tus precios antes de solicitar aprobación.');
   const templates=[
     {name:c.opening_template,text:'Hi! I have generated ${{1}} in GMV for the {{2}} audience. I am {{3}} from the VAAS community. My packages are: 1 video for ${{4}}, 5 for ${{5}}, or 10 for ${{6}}. Last 30 days GMV: ${{7}}. TikTok: @{{8}}. Would you like to discuss a paid collaboration? Reply STOP to opt out.',example:['200000','Spanish-speaking','Alex','300','1200','2000','20000','alexcreator']},
-    {name:c.followup_template,text:'Hi! Would you like to continue discussing our paid collaboration? Reply STOP if you prefer not to receive more messages.',example:[]},
+    {name:c.followup_template,text:'Hi! Any updates on the paid collab?',example:[]},
   ];
   for(const t of templates){
     const list=await zernio(`/whatsapp/templates?${new URLSearchParams({accountId:c.account_id,name:t.name,language:c.template_language})}`);
