@@ -171,7 +171,9 @@ test('daily sync uses only own history, deduplicates and preserves member decisi
  mock.method(supabase,'from',fakeDb(tables));mock.method(supabase,'rpc',async()=>({data:true,error:null}));
  mock.method(globalThis,'fetch',async(url)=>new Response(JSON.stringify(String(url).includes('/api/internal/')?{ok:true,contacts:source}:{data:[{accountId:'aaaaaaaaaaaaaaaaaaaaaaaa',platform:'whatsapp',participantId:'8613700138000'}],pagination:{hasMore:false},meta:{accountsQueried:1,accountsFailed:0}}),{status:200}));
  try {
-  await syncContacts(u,{force:true});
+  // A recent preview import must not delay the first history scan after connecting.
+  tables.closer_automation[0].last_sync_at=new Date().toISOString();
+  await syncContacts(u);
   assert.equal(tables.closer_contacts.length,4);
   assert.equal(tables.closer_contacts.find(c=>c.phone==='8613800138000').state,'review');
   assert.equal(tables.closer_contacts.find(c=>c.phone==='8613700138000').state,'review');

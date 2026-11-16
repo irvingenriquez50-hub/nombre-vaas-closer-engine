@@ -56,7 +56,9 @@ export async function syncContacts(userId,{force=false}={}) {
  if(!activeMembership(await member(userId))) throw new Error('Tu acceso necesita renovación.');
  return withLease('sync:'+userId,async()=>{
   const a=await automation(userId);
-  if(!force && a.last_sync_at && Date.now()-Date.parse(a.last_sync_at)<15*60000) return {synced:false};
+  const c=await connection(userId);
+  const needsHistory=c?.connected && (!a.history_checked_at || a.history_account_id!==c.account_id);
+  if(!force && !needsHistory && a.last_sync_at && Date.now()-Date.parse(a.last_sync_at)<15*60000) return {synced:false};
   try {
    const now=Date.now(),since=now-a.lookback_days*86400000;
    if(!process.env.CLOSER_SYNC_SECRET || !process.env.APP_URL) throw new Error('Falta configurar la importación automática.');
@@ -67,7 +69,6 @@ export async function syncContacts(userId,{force=false}={}) {
    if(!response.ok) throw new Error('No se pudo importar la lista. Se volverá a intentar automáticamente.');
    const source=await response.json();
    if(!source.ok || !Array.isArray(source.contacts)) throw new Error('La lista de contactos no está disponible.');
-   const c=await connection(userId);
    const [leads,deals,outbound,existing]=await Promise.all([
     allRows('leads',userId),allRows('closed_deals',userId),allRows('zernio_outbound',userId,'id,lead_id,state'),allRows('closer_contacts',userId)]);
    const own=new Map(leads.map(l=>[canonicalPhone(l.phone),l]));
