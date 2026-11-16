@@ -75,7 +75,7 @@ export async function listActiveLeads(userId) {
     .neq("status", "cerrado")
     .neq("status", "dormant")
     .neq("status", "fallido")
-    .eq("paused", false);
+    .eq("paused", false).order('added_at');
   return data || [];
 }
 

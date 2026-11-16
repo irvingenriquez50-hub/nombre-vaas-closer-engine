@@ -34,6 +34,9 @@ test('prices, recipient identity, human takeover and action identity',()=>{
   assert.equal(validPhone('bsuid:a12345678910'),false);
   assert.equal(validPhone('+86 138 0013 8000'),true);
   assert.notEqual(actionKey('account1',{id:'lead1'},'opening'),actionKey('account2',{id:'lead1'},'opening'));
+  assert.equal(actionKey('a',{id:'lead',outreach_cycle:'cycle',last_inbound_at:'old'},'opening'),actionKey('a',{id:'lead',outreach_cycle:'cycle',last_inbound_at:'new',last_outbound_at:'changed'},'opening'));
+  assert.notEqual(actionKey('a',{id:'lead',outreach_cycle:'one'},'opening'),actionKey('a',{id:'lead',outreach_cycle:'two'},'opening'));
+  assert.notEqual(actionKey('a',{id:'lead'},'text','reply'),actionKey('a',{id:'lead'},'text','auto_close'));
   assert.equal(isHumanMessage({event:'message.sent',message:{source:'whatsapp_business_app'}}),true);
   assert.equal(isHumanMessage({event:'message.sent',message:{source:'cloud_api',sentVia:'api'}}),false);
 });

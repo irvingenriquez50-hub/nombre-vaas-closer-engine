@@ -1,3 +1,4 @@
+import {automation} from './autopilot.js';
 import { randomBytes } from 'node:crypto';
 import { supabase } from './supabase.js';
 import { zernio } from './zernio-api.js';
@@ -13,7 +14,7 @@ export const settings = () => db(supabase.from('closer_settings').select('*').eq
 export const member = userId => db(supabase.from('users').select('id,status,expires_at').eq('id', userId).single());
 export const saveConnection = (userId, patch) => db(supabase.from('zernio_connections').update({ ...patch, updated_at: new Date().toISOString() }).eq('user_id', userId));
 export function configMissing() {
-  return ['ZERNIO_API_KEY','ZERNIO_WEBHOOK_SECRET','APP_URL','PUBLIC_ENGINE_URL','ADMIN_EMAIL','ANTHROPIC_API_KEY'].filter(k => !process.env[k]);
+  return ['ZERNIO_API_KEY','ZERNIO_WEBHOOK_SECRET','APP_URL','PUBLIC_ENGINE_URL','ADMIN_EMAIL','ANTHROPIC_API_KEY','CLOSER_SYNC_SECRET'].filter(k => !process.env[k]);
 }
 function publicUrl(name) {
   const url = new URL(process.env[name]);
@@ -49,6 +50,7 @@ export async function status(userId, force = false) {
     db(supabase.from('scripts').select('*').eq('user_id',userId).maybeSingle()),
     db(supabase.from('pricing_tiers').select('videos,anchor,medio,floor').eq('user_id',userId)),
   ]);
+  const a=await automation(userId);
   const ready = profileReady(script,tiers || []);
   const checks = [
     {key:'setup',label:'Sistema configurado',ok:missing.length===0},
@@ -56,6 +58,7 @@ export async function status(userId, force = false) {
     {key:'connection',label:'WhatsApp conectado',ok:!!c?.connected},
     {key:'profile',label:'Perfil y precios guardados',ok:!!ready},
     {key:'templates',label:'Mensajes aprobados por WhatsApp',ok:!!c?.templates_ready},
+    {key:'consent',label:'Permiso de contacto confirmado',ok:!!a.consent_at},
     {key:'global',label:'Envíos habilitados por el administrador',ok:!!global.sends_enabled},
   ];
   return {connected:!!c?.connected,botEnabled:!!c?.bot_enabled,phone:c?.phone_number || null,
@@ -63,7 +66,7 @@ export async function status(userId, force = false) {
 }
 export async function assertCanSend(userId) {
   const [c,user,global] = await Promise.all([refreshConnection(userId),member(userId),settings()]);
-  if (configMissing().length || !global.sends_enabled || !activeMembership(user) || !c?.bot_enabled || !c?.connected) {
+  if (!(await automation(userId)).consent_at || configMissing().length || !global.sends_enabled || !activeMembership(user) || !c?.bot_enabled || !c?.connected) {
     const error = new Error('El bot está pausado o la conexión necesita atención.'); error.code='BOT_PAUSED'; throw error;
   }
   return c;

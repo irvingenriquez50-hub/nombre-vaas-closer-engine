@@ -5,6 +5,7 @@ import { db, member, status, beginConnection, finishConnection, setBot, settings
 import { acceptEvent } from './zernio-events.js';
 import { startProcessForNumber } from './queue.js';
 import { sendMessage } from './sessions.js';
+import {automationStatus,saveAutomation,syncContacts,decideContact,manageLead} from './autopilot.js';
 
 const asyncRoute = fn => (req,res,next) => Promise.resolve(fn(req,res,next)).catch(next);
 export function createApp() {
@@ -33,6 +34,11 @@ export function createApp() {
     next();
   });
   app.get('/status/:userId',asyncRoute(async(req,res)=>res.json({ok:true,...await status(req.params.userId)})));
+  app.get('/automation/:userId',asyncRoute(async(req,res)=>res.json({ok:true,...await automationStatus(req.params.userId)})));
+  app.put('/automation/:userId',asyncRoute(async(req,res)=>res.json({ok:true,...await saveAutomation(req.params.userId,req.actor.id,req.body)})));
+  app.post('/automation/:userId/sync',asyncRoute(async(req,res)=>res.json({ok:true,...await syncContacts(req.params.userId,{force:true}),...await automationStatus(req.params.userId)})));
+  app.post('/automation/:userId/decide',asyncRoute(async(req,res)=>res.json({ok:true,...await decideContact(req.params.userId,req.body.phone,req.body.action)})));
+  app.post('/lead/:userId/:leadId',asyncRoute(async(req,res)=>res.json(await manageLead(req.params.userId,req.params.leadId,req.body.action))));
   app.post('/connect/:userId',asyncRoute(async(req,res)=>res.json({ok:true,...await beginConnection(req.params.userId,req.actor.id,req.body?.onboarding)})));
   app.post('/connection/complete',asyncRoute(async(req,res)=>res.json({ok:true,...await finishConnection(req.actor.id,req.body || {})})));
   app.post('/reset/:userId',asyncRoute(async(req,res)=>res.json({ok:true,...await status(req.params.userId,true)})));
@@ -42,7 +48,8 @@ export function createApp() {
     const {userId}=req.params;
     if(!activeMembership(await member(userId))) return res.status(403).json({ok:false,error:'Tu acceso necesita renovación.'});
     if(!validPhone(req.body.phone)) return res.status(400).json({ok:false,error:'Incluye un número válido con código de país.'});
-    const result=await startProcessForNumber({sendMessage:(jid,body)=>sendMessage(userId,jid,body.text)},userId,req.body.phone,{skipMessage1:!!req.body.skipMessage1});
+    const result=await startProcessForNumber({sendMessage:(jid,body)=>sendMessage(userId,jid,body.text,body.expected)},userId,req.body.phone,{skipMessage1:!!req.body.skipMessage1});
+    if(!result.duplicate && !req.body.skipMessage1) await manageLead(userId,result.lead.id,'send');
     res.status(result.duplicate?409:200).json({ok:!result.duplicate,...result,...(result.duplicate?{error:'Este contacto ya está en tu lista.'}:{})});
   }));
   app.get('/admin/overview',asyncRoute(async(req,res)=>{
@@ -52,7 +59,13 @@ export function createApp() {
       supabase.from('zernio_events').select('id',{count:'exact',head:true}).is('processed_at',null).gte('attempts',12),
       supabase.from('zernio_outbound').select('id',{count:'exact',head:true}).in('state',['unknown','sending'])]);
     if(failedEvents.error || uncertainSends.error) throw new Error('No se pudo revisar el estado de los envíos.');
-    res.json({ok:true,globalEnabled:global.sends_enabled,missing:configMissing(),channels,failedEvents:failedEvents.count,uncertainSends:uncertainSends.count});
+    const automationCounts={};
+    for(const state of ['queued','review','active','collaborated']) {
+      const result=await supabase.from('closer_contacts').select('phone',{count:'exact',head:true}).eq('state',state);
+      if(result.error) throw new Error('No se pudo revisar la cola automática.');
+      automationCounts[state]=result.count;
+    }
+    res.json({ok:true,globalEnabled:global.sends_enabled,missing:configMissing(),channels,automationCounts,failedEvents:failedEvents.count,uncertainSends:uncertainSends.count});
   }));
   app.post('/admin/sends',asyncRoute(async(req,res)=>{
     if(!req.isAdmin) return res.sendStatus(403);

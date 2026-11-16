@@ -38,13 +38,14 @@ export async function processEvent(e) {
   if(e.event!=='message.received' || msg.direction!=='incoming') return;
   const text=msg.text || '[Archivo recibido; requiere revisión de una persona]';
   await appendMessage(c.user_id,lead.jid,'user',text,{eventId:e.id,at:msg.sentAt});
-  const stop=/^\s*(stop|unsubscribe|baja|cancelar|no me escribas|no more messages)\s*[.!]?\s*$/i.test(text);
+  const stop=/^\s*(stop|unsubscribe|baja|cancelar)\s*[.!]?\s*$/i.test(text) || /\b(stop (?:messaging|texting|contacting)|do not contact|don't (?:contact|message|text)|remove (?:me|my number)|no more messages|no me escribas|deja de escribirme)\b/i.test(text);
   if(stop || e.metadata?.standby || !msg.text || msg.attachments?.length) {
+    if(stop) await db(supabase.from('closer_contacts').upsert({user_id:c.user_id,phone:canonicalPhone(lead.phone),state:'blocked',reason:'Pidió dejar de recibir mensajes.'},{onConflict:'user_id,phone'}));
     await db(supabase.from('leads').update({paused:true,last_error:stop?'El contacto pidió dejar de recibir mensajes.':'Una persona debe revisar esta conversación.',
       ...(stop?{negotiation:{...(lead.negotiation||{}),optedOut:true}}:{})}).eq('id',lead.id)); return;
   }
   if(lead.status==='nuevo') await db(supabase.from('leads').update({status:'negociando'}).eq('id',lead.id));
-  await handleInboundMessage({sendMessage:(jid,body)=>sendMessage(c.user_id,jid,body.text)},c.user_id,lead.jid,text,{recorded:true});
+  await handleInboundMessage({sendMessage:(jid,body)=>sendMessage(c.user_id,jid,body.text,body.expected)},c.user_id,lead.jid,text,{recorded:true});
 }
 let running=false;
 export async function drainEvents() {

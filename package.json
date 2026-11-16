@@ -14,6 +14,7 @@
     "cors": "2.8.6",
     "dotenv": "16.6.1",
     "express": "4.22.3",
+    "libphonenumber-js": "1.13.16",
     "pino": "9.14.0",
     "qrcode": "1.5.4",
     "ws": "8.23.0"
