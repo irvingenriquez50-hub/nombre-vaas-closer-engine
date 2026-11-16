@@ -14,13 +14,53 @@ process.env.CLOSER_SYNC_SECRET='test-only';
 const {supabase}=await import('../src/supabase.js');
 const {createApp}=await import('../src/app.js');
 const {sendZernio}=await import('../src/zernio-messages.js');
-const {finishConnection,setBot}=await import('../src/zernio-control.js');
+const {finishConnection,setBot,syncSavedTemplates,status}=await import('../src/zernio-control.js');
 const {processEvent}=await import('../src/zernio-events.js');
 const {digest}=await import('../src/zernio-policy.js');
 const {getNextMove}=await import('../src/negotiate.js');
 const {syncContacts,prepareNextContact,restrictedMarketing}=await import('../src/autopilot.js');
 const {drainTrackerReviews}=await import('../src/tracker-reviews.js');
 const u='11111111-1111-4111-8111-111111111111',v='22222222-2222-4222-8222-222222222222';
+
+test('saving a connected complete profile submits missing templates once and reflects real approval without activating or messaging',async()=>{
+  const tables=fixture();tables.zernio_connections[0].bot_enabled=false;
+  tables.scripts=[{user_id:u,short_name:'Alex',gmv_total:'2000',gmv_30d:'200',market:'English-speaking',tiktok_handle:'alex'}];
+  tables.pricing_tiers=[1,5,10].map(videos=>({user_id:u,videos,anchor:videos*200,floor:videos*100}));
+  const templates=[];let submissions=0,fail=false;
+  mock.method(supabase,'from',fakeDb(tables));
+  mock.method(globalThis,'fetch',async(url,opts)=>{
+    if(fail)throw new Error('offline');
+    if(url.includes('/health'))return Response.json({platform:'whatsapp',tokenStatus:{valid:true},platformConnection:{status:'connected'}});
+    assert.ok(url.includes('/whatsapp/templates'),'approval never calls a message endpoint');
+    if(opts.method==='POST'){const body=JSON.parse(opts.body);submissions++;templates.push({...body,status:'PENDING'});return Response.json({template:templates.at(-1)});}
+    return Response.json({templates});
+  });
+  try{
+    let result=await syncSavedTemplates(u);
+    assert.equal(result.approval.opening.status,'PENDING');assert.equal(submissions,2);assert.equal(result.canActivate,false);
+    result=await syncSavedTemplates(u);assert.equal(submissions,2);
+    templates[0].status='APPROVED';result=await status(u,true);
+    assert.equal(result.approval.opening.status,'APPROVED');assert.equal(result.approval.followup.status,'PENDING');assert.equal(result.canActivate,false);
+    templates[1].status='APPROVED';result=await status(u,true);assert.equal(result.canActivate,true);assert.equal(result.botEnabled,false);
+    result=await syncSavedTemplates(u);assert.equal(submissions,2);assert.equal(result.approval.opening.status,'APPROVED');
+    templates[0].status='REJECTED';templates[0].reason='INCORRECT_CATEGORY';result=await status(u,true);
+    assert.equal(result.approval.opening.status,'REJECTED');assert.equal(result.approval.opening.reason,'INCORRECT_CATEGORY');assert.equal(result.canActivate,false);
+    await syncSavedTemplates(u);assert.equal(submissions,2,'saving never resubmits a rejected template blindly');
+    fail=true;result=await status(u,true);assert.equal(result.approval.opening.status,'UNKNOWN');assert.equal(result.canActivate,false);
+    assert.equal(tables.zernio_outbound?.length||0,0);
+  }finally{mock.restoreAll();}
+});
+
+test('saving without a connection or complete profile does not submit templates',async()=>{
+  const tables=fixture();tables.zernio_connections=[];let calls=0;
+  mock.method(supabase,'from',fakeDb(tables));
+  mock.method(globalThis,'fetch',async url=>{calls++;return Response.json(url.includes('/health')?{platform:'whatsapp',tokenStatus:{valid:true},platformConnection:{status:'connected'}}:{templates:[]});});
+  try{
+    let result=await syncSavedTemplates(u);assert.equal(calls,0);assert.equal(result.approval.opening.status,'NOT_SUBMITTED');
+    tables.zernio_connections.push(fixture().zernio_connections[0]);
+    result=await syncSavedTemplates(u);assert.equal(calls,3);assert.equal(result.approval.opening.status,'NOT_SUBMITTED');assert.equal(result.canActivate,false);
+  }finally{mock.restoreAll();}
+});
 
 // In-memory PostgREST boundary; actual SQL and permissions are tested separately in migration.test.js.
 function fakeDb(tables){

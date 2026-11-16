@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { supabase } from './supabase.js';
 import { zernio } from './zernio-api.js';
 import { digest, healthyAccount, activeMembership, profileReady, canonicalPhone, validPhone } from './zernio-policy.js';
+import {templateVerdict,publicApproval} from './template-approval.js';
 
 export async function db(query) {
   const { data, error } = await query;
@@ -32,16 +33,19 @@ export async function refreshConnection(userId, force = false) {
       zernio(`/whatsapp/templates?${new URLSearchParams({accountId:c.account_id,name:c.opening_template,language:c.template_language})}`),
       zernio(`/whatsapp/templates?${new URLSearchParams({accountId:c.account_id,name:c.followup_template,language:c.template_language})}`),
     ]);
-    const approved = (result, name) => result.templates?.some(t => t.name === name && t.language === c.template_language && t.status === 'APPROVED');
+    const template_review={accountId:c.account_id,checkedAt:new Date().toISOString(),
+      opening:templateVerdict(opening,c.opening_template,c.template_language),
+      followup:templateVerdict(followup,c.followup_template,c.template_language)};
     const connected = healthyAccount(health);
-    patch = { connected, templates_ready: !!(approved(opening,c.opening_template) && approved(followup,c.followup_template)),
+    patch = { connected, template_review, templates_ready: template_review.opening.status==='APPROVED' && template_review.followup.status==='APPROVED',
       health_checked_at:new Date().toISOString(), last_error: connected ? null : 'Revisa o vuelve a conectar tu número.',
       ...(!connected ? {bot_enabled:false} : {}) };
   } catch {
-    patch = {connected:false, health_checked_at:new Date().toISOString(), last_error:'No pudimos comprobar la conexión. Vuelve a revisar en un minuto.'};
+    patch = {connected:false,templates_ready:false,template_review:{accountId:c.account_id,opening:{status:'UNKNOWN'},followup:{status:'UNKNOWN'},checkedAt:null}, health_checked_at:new Date().toISOString(), last_error:'No pudimos comprobar la conexión. Vuelve a revisar en un minuto.'};
   }
-  await saveConnection(userId, patch);
-  return {...c,...patch};
+  const saved=await db(supabase.from('zernio_connections').update({...patch,updated_at:new Date().toISOString()})
+    .eq('user_id',userId).eq('account_id',c.account_id).select('*').maybeSingle());
+  return saved || connection(userId);
 }
 export async function status(userId, force = false) {
   const missing = configMissing();
@@ -62,7 +66,7 @@ export async function status(userId, force = false) {
     {key:'global',label:'Envíos habilitados por el administrador',ok:!!global.sends_enabled},
   ];
   return {connected:!!c?.connected,botEnabled:!!c?.bot_enabled,phone:c?.phone_number || null,
-    canActivate:checks.every(x=>x.ok), checks, error:c?.last_error || null, provider:'zernio'};
+    canActivate:checks.every(x=>x.ok), checks, approval:publicApproval(c), error:c?.last_error || null, provider:'zernio'};
 }
 export async function assertCanSend(userId) {
   const [c,user,global] = await Promise.all([refreshConnection(userId),member(userId),settings()]);
@@ -128,7 +132,7 @@ export async function finishConnection(actorId, {state, accountId, profileId}) {
   if (!validPhone(account.username)) throw new Error('Zernio todavía no confirmó el número.');
   const userId = await db(supabase.rpc('closer_finish_onboarding',{p_hash:digest(state),p_actor:actorId,p_account:accountId,p_phone:phone}));
   await refreshConnection(userId,true);
-  try { await prepareTemplates(userId); }
+  try { await syncSavedTemplates(userId); }
   catch { await saveConnection(userId,{last_error:'Número conectado. Falta preparar o revisar la aprobación de los mensajes.'}); }
   return {userId};
 }
@@ -136,6 +140,10 @@ export async function prepareTemplates(userId) {
   if(!activeMembership(await member(userId))) throw new Error('Tu acceso necesita renovación.');
   const c=await connection(userId);
   if(!c?.account_id) throw new Error('Conecta tu WhatsApp primero.');
+  const [script,tiers]=await Promise.all([
+    db(supabase.from('scripts').select('*').eq('user_id',userId).maybeSingle()),
+    db(supabase.from('pricing_tiers').select('videos,anchor,medio,floor').eq('user_id',userId))]);
+  if(!profileReady(script,tiers || [])) throw new Error('Completa y guarda Tu escrito y tus precios antes de solicitar aprobación.');
   const templates=[
     {name:c.opening_template,text:'Hi! I have generated ${{1}} in GMV for the {{2}} audience. I am {{3}} from the VAAS community. My packages are: 1 video for ${{4}}, 5 for ${{5}}, or 10 for ${{6}}. Last 30 days GMV: ${{7}}. TikTok: @{{8}}. Would you like to discuss a paid collaboration? Reply STOP to opt out.',example:['200000','Spanish-speaking','Alex','300','1200','2000','20000','alexcreator']},
     {name:c.followup_template,text:'Hi! Would you like to continue discussing our paid collaboration? Reply STOP if you prefer not to receive more messages.',example:[]},
@@ -147,4 +155,11 @@ export async function prepareTemplates(userId) {
       components:[{type:'BODY',text:t.text,...(t.example.length?{example:{body_text:[t.example]}}:{})}]}});
   }
   return status(userId,true);
+}
+
+export async function syncSavedTemplates(userId) {
+  const current=await status(userId,true);
+  if(!current.connected || !current.checks.find(c=>c.key==='profile')?.ok) return current;
+  // Existing approved/pending/rejected variants are never recreated by saving variable values.
+  return prepareTemplates(userId);
 }

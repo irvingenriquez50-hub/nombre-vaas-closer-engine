@@ -1,7 +1,7 @@
 import express from 'express';
 import { supabase } from './supabase.js';
 import { verifySignature, activeMembership, validPhone } from './zernio-policy.js';
-import { db, member, status, beginConnection, finishConnection, setBot, settings, configMissing, prepareTemplates } from './zernio-control.js';
+import { db, member, status, beginConnection, finishConnection, setBot, settings, configMissing, prepareTemplates, syncSavedTemplates } from './zernio-control.js';
 import { acceptEvent } from './zernio-events.js';
 import { startProcessForNumber } from './queue.js';
 import { sendMessage } from './sessions.js';
@@ -45,6 +45,7 @@ export function createApp() {
   app.post('/reset/:userId',asyncRoute(async(req,res)=>res.json({ok:true,...await status(req.params.userId,true)})));
   app.post('/bot/:userId',asyncRoute(async(req,res)=>res.json({ok:true,...await setBot(req.params.userId,req.body.enabled)})));
   app.post('/templates/:userId',asyncRoute(async(req,res)=>res.json({ok:true,...await prepareTemplates(req.params.userId)})));
+  app.post('/templates/:userId/sync',asyncRoute(async(req,res)=>res.json({ok:true,...await syncSavedTemplates(req.params.userId)})));
   app.post('/add-lead/:userId',asyncRoute(async(req,res)=>{
     const {userId}=req.params;
     if(!activeMembership(await member(userId))) return res.status(403).json({ok:false,error:'Tu acceso necesita renovación.'});
