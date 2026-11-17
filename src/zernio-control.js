@@ -4,6 +4,7 @@ import { supabase } from './supabase.js';
 import { zernio } from './zernio-api.js';
 import { digest, healthyAccount, activeMembership, profileReady, canonicalPhone, validPhone } from './zernio-policy.js';
 import {templateVerdict,publicApproval} from './template-approval.js';
+import {OPENING_BODY,FOLLOWUP_BODY,openingParams} from './whatsapp-templates.js';
 
 export async function db(query) {
   const { data, error } = await query;
@@ -34,8 +35,8 @@ export async function refreshConnection(userId, force = false) {
       zernio(`/whatsapp/templates?${new URLSearchParams({accountId:c.account_id,name:c.followup_template,language:c.template_language})}`),
     ]);
     const template_review={accountId:c.account_id,checkedAt:new Date().toISOString(),
-      opening:templateVerdict(opening,c.opening_template,c.template_language),
-      followup:templateVerdict(followup,c.followup_template,c.template_language)};
+      opening:templateVerdict(opening,c.opening_template,c.template_language,OPENING_BODY),
+      followup:templateVerdict(followup,c.followup_template,c.template_language,FOLLOWUP_BODY)};
     const connected = healthyAccount(health);
     patch = { connected, template_review, templates_ready: template_review.opening.status==='APPROVED' && template_review.followup.status==='APPROVED',
       health_checked_at:new Date().toISOString(), last_error: connected ? null : 'Revisa o vuelve a conectar tu número.',
@@ -145,14 +146,16 @@ export async function prepareTemplates(userId) {
     db(supabase.from('pricing_tiers').select('videos,anchor,medio,floor').eq('user_id',userId))]);
   if(!profileReady(script,tiers || [])) throw new Error('Completa y guarda Tu escrito y tus precios antes de solicitar aprobación.');
   const templates=[
-    {name:c.opening_template,text:'Hi! I have generated ${{1}} in GMV for the {{2}} audience. I am {{3}} from the VAAS community. My packages are: 1 video for ${{4}}, 5 for ${{5}}, or 10 for ${{6}}. Last 30 days GMV: ${{7}}. TikTok: @{{8}}. Would you like to discuss a paid collaboration? Reply STOP to opt out.',example:['200000','Spanish-speaking','Alex','300','1200','2000','20000','alexcreator']},
-    {name:c.followup_template,text:'Hi! Any updates on the paid collab?',example:[]},
+    {name:c.opening_template,text:OPENING_BODY,example:openingParams({gmvTotal:script.gmv_total,market:script.market,shortName:script.short_name,gmv30d:script.gmv_30d,tiktokHandle:script.tiktok_handle},tiers)},
+    {name:c.followup_template,text:FOLLOWUP_BODY,example:[]},
   ];
   for(const t of templates){
     const list=await zernio(`/whatsapp/templates?${new URLSearchParams({accountId:c.account_id,name:t.name,language:c.template_language})}`);
-    if(list.templates?.some(x=>x.name===t.name && x.language===c.template_language)) continue;
+    const verdict=templateVerdict(list,t.name,c.template_language,t.text);
+    if(verdict.status==='CONTENT_MISMATCH') throw new Error(verdict.reason);
+    if(verdict.status!=='NOT_SUBMITTED') continue;
     await zernio('/whatsapp/templates',{method:'POST',body:{accountId:c.account_id,name:t.name,category:'MARKETING',language:c.template_language,
-      components:[{type:'BODY',text:t.text,...(t.example.length?{example:{body_text:[t.example]}}:{})}]}});
+      components:[{type:'body',text:t.text,...(t.example.length?{example:{body_text:[t.example]}}:{})}]}});
   }
   return status(userId,true);
 }

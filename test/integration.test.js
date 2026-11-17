@@ -20,6 +20,7 @@ const {digest}=await import('../src/zernio-policy.js');
 const {getNextMove}=await import('../src/negotiate.js');
 const {syncContacts,prepareNextContact,restrictedMarketing}=await import('../src/autopilot.js');
 const {drainTrackerReviews}=await import('../src/tracker-reviews.js');
+const {OPENING_BODY,FOLLOWUP_BODY}=await import('../src/whatsapp-templates.js');
 const u='11111111-1111-4111-8111-111111111111',v='22222222-2222-4222-8222-222222222222';
 
 test('saving a connected complete profile submits missing templates once and reflects real approval without activating or messaging',async()=>{
@@ -32,7 +33,15 @@ test('saving a connected complete profile submits missing templates once and ref
     if(fail)throw new Error('offline');
     if(url.includes('/health'))return Response.json({platform:'whatsapp',tokenStatus:{valid:true},platformConnection:{status:'connected'}});
     assert.ok(url.includes('/whatsapp/templates'),'approval never calls a message endpoint');
-    if(opts.method==='POST'){const body=JSON.parse(opts.body);submissions++;templates.push({...body,status:'PENDING'});return Response.json({template:templates.at(-1)});}
+    if(opts.method==='POST'){
+      const body=JSON.parse(opts.body);
+      assert.equal(body.components[0].type,'body');
+      if(body.name==='vaas_opening_message'){
+        assert.equal(body.components[0].text,OPENING_BODY);
+        assert.deepEqual(body.components[0].example.body_text,[['2000','English-speaking','Alex','200','1000','2000','200','alex']]);
+      }else assert.equal(body.components[0].text,FOLLOWUP_BODY);
+      submissions++;templates.push({...body,status:'PENDING'});return Response.json({template:templates.at(-1)});
+    }
     return Response.json({templates});
   });
   try{

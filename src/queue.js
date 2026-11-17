@@ -18,6 +18,7 @@ import { assertCanSend } from "./zernio-control.js";
 import { safeClose } from "./zernio-policy.js";
 import { getNextMove } from "./negotiate.js";
 import { sendOpeningTemplate, sendFollowupTemplate } from "./sessions.js";
+import {openingParams,FOLLOWUP_BODY} from './whatsapp-templates.js';
 
 // El cierre automático se dispara a las 18h (no 24h) a propósito: la marca SÍ nos
 // escribió durante la negociación, así que la ventana de 24h de WhatsApp está
@@ -127,20 +128,7 @@ function withinSendWindow(userId) {
 async function buildOpeningTemplateParams(userId) {
   const script = await getScript(userId);
   const tiers = await getPricingTiers(userId);
-  const tier1 = tiers.find((t) => t.videos === 1);
-  const tier5 = tiers.find((t) => t.videos === 5);
-  const tier10 = tiers.find((t) => t.videos === 10);
-
-  return [
-    script.gmvTotal || "0",
-    script.market || "Spanish-speaking",
-    script.shortName || "",
-    String(tier1?.anchor ?? ""),
-    String(tier5?.anchor ?? ""),
-    String(tier10?.anchor ?? ""),
-    script.gmv30d || "0",
-    script.tiktokHandle || "",
-  ];
+  return openingParams(script,tiers);
 }
 
 export async function startProcessForNumber(sock, userId, phoneRaw, { skipMessage1 = false } = {}) {
@@ -537,7 +525,7 @@ export async function sweepTimers(sock, userId) {
         continue;
       }
 
-      const followupText = "Hey, any updates?";
+      const followupText = FOLLOWUP_BODY;
       try {
         await sendFollowupTemplate(userId, lead.jid);
         await appendMessage(userId, lead.jid, "assistant", followupText);
