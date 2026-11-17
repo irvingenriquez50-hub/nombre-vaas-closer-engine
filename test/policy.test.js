@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {createHmac} from 'node:crypto';
-import {verifySignature,healthyAccount,activeMembership,serviceWindowOpen,actionKey,safeClose,profileReady,validPhone,isHumanMessage} from '../src/zernio-policy.js';
+import {verifySignature,healthyAccount,activeMembership,serviceWindowOpen,actionKey,profileReady,validPhone,isHumanMessage} from '../src/zernio-policy.js';
 import {createZernioClient} from '../src/zernio-api.js';
 
 test('webhook signature binds exact bytes and rejects missing/invalid credentials',()=>{
@@ -25,10 +25,6 @@ test('expired access and closed 24h windows prevent sends',()=>{
 });
 test('prices, recipient identity, human takeover and action identity',()=>{
   const tiers=[{videos:1,anchor:300,floor:200},{videos:5,anchor:1200,floor:800},{videos:10,anchor:2000,floor:1500}];
-  assert.equal(safeClose(tiers,799,5),false);
-  assert.equal(safeClose(tiers,800,5),true);
-  assert.equal(safeClose(tiers,800,10),false);
-  assert.equal(safeClose(tiers,800,3),false);
   assert.equal(profileReady({short_name:'Ana',tiktok_handle:'ana',gmv_total:'100',gmv_30d:'50',market:'US'},tiers),true);
   assert.equal(profileReady({},tiers),false);
   assert.equal(validPhone('bsuid:a12345678910'),false);

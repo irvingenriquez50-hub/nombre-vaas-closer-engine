@@ -21,7 +21,7 @@ The hosted flow creates the scoped webhook automatically. After connection, miss
 - Incoming phone matching uses the entire number within one account. A phone-hidden BSUID uses an already-known conversation; it is never guessed from digits.
 - Phone-app/human messages, standby events, opt-outs and unsupported media pause the conversation for a person.
 - Outbound attempts have a persistent identity and Zernio Idempotency-Key. An ambiguous timeout/5xx is held for review instead of blindly resent. Inspect the Zernio conversation and outbound record before resuming; do not clear an ambiguous record without reconciliation.
-- Free-text sends require a recent inbound message. Prices below the configured floor cannot close a deal. Package changes clear the preceding package's offer state.
+- Free-text sends require a recent inbound message. Negotiation rules are unchanged by the provider swap: price tiers, the two-round hold at the mid price, the minimum-price guard, the 18-hour silence close on the brand's best real offer, follow-up timing, the 5-minute reply delay, the 15-minute lost-reply rescue and the admin test mode behave as in the pre-Zernio engine.
 - Existing Tracker reporting remains in place. This work does not claim to have verified delivery to the live Tracker or made its reporting durable.
 
 ## Coordinated rollout (not executed)

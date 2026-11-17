@@ -183,5 +183,5 @@ export async function automationStatus(userId) {
  for(const l of leads) if(l.last_outbound_at?.startsWith(today)) counts.sentToday++;
  return {settings:{lookbackDays:CONTACT_DAYS,consent:!!a.consent_at,lastSync:a.last_sync_at,error:a.last_error,historyChecked:!!a.history_checked_at},counts,
   contacts:contacts.sort((x,y)=>(y.source_at||'').localeCompare(x.source_at||'')).map(row=>({...row,lead:byPhone.get(row.phone)||null})),
-  cadenceSeconds:60,replyMinutes:Number(process.env.REPLY_DEBOUNCE_MINUTES||5)};
+  cadenceSeconds:60,replyMinutes:Math.round(Number(process.env.REPLY_DEBOUNCE_SECONDS||300)/60)};
 }

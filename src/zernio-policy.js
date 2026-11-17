@@ -34,9 +34,5 @@ export function actionKey(accountId, lead, kind, intent='reply') {
       lead.followup_count||0,lead.negotiation?.checkbackCount||0,lead.negotiation?.waitingNudges||0]:[intent,inboundId];
   return digest(JSON.stringify([accountId,lead.id,lead.outreach_cycle,kind,phase]));
 }
-export function safeClose(tiers, price, videos) {
-  const tier = tiers.find(t => Number(t.videos) === Number(videos));
-  return !!tier && Number.isFinite(Number(price)) && Number(price) >= Number(tier.floor) && Number(tier.floor) > 0;
-}
 export const isHumanMessage = event => event.event === 'message.sent' &&
   (['whatsapp_business_app', 'meta_business_agent'].includes(event.message?.source) || event.message?.sentVia === 'human');
