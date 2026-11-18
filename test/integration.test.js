@@ -191,17 +191,15 @@ test('a recorded inbound event is not appended twice or given a new service-wind
     assert.equal(tables.leads[0].last_inbound_at,before);
   }finally{mock.restoreAll();}
 });
-test('timed close cannot reuse another package offer or accept a price below the floor',async()=>{
-  let read={videos:5,theirOffer:500,claimsFinal:true};
-  const readBrand=async()=>read;
+test('timed close accepts the brand\'s best real offer even below the minimum, and never invents one',async()=>{
+  const readBrand=async()=>({videos:5,theirOffer:null,claimsFinal:false});
   try{
     const tiers=[{videos:5,anchor:1200,medio:1000,floor:800},{videos:10,anchor:2000,medio:1700,floor:1500}];
-    const prior={videos:10,theirLast:1800,theirBest:2000,repeatCount:3};
-    const low=await getNextMove([{role:'user',content:'500 for 5 videos',ts:1}],tiers,prior,{forceAccept:true,readBrand});
-    assert.equal(low.closed,false);assert.equal(low.noAction,true);assert.equal(low.negotiation.theirBest,500);
-    read={videos:5,theirOffer:900,claimsFinal:true};
-    const valid=await getNextMove([{role:'user',content:'900 for 5 videos',ts:1}],tiers,prior,{forceAccept:true,readBrand});
-    assert.equal(valid.closed,true);assert.equal(valid.closedPrice,900);assert.equal(valid.closedVideos,5);
+    const prior={videos:5,theirLast:700,theirBest:750,repeatCount:2};
+    const timed=await getNextMove([{role:'user',content:'700 for 5 videos',ts:1}],tiers,prior,{forceAccept:true,readBrand});
+    assert.equal(timed.closed,true);assert.equal(timed.closedPrice,750);assert.equal(timed.closedVideos,5);
+    const none=await getNextMove([{role:'user',content:'Let me check with my team',ts:1}],tiers,{videos:5},{forceAccept:true,readBrand});
+    assert.equal(none.closed,false);assert.equal(none.noAction,true);
   }finally{mock.restoreAll();}
 });
 

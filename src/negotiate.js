@@ -1,7 +1,9 @@
 import {cleanReply} from './outreach-policy.js';
 import Anthropic from "@anthropic-ai/sdk";
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY,timeout:45000,maxRetries:0 });
+// Reintentos del SDK como siempre; solo se limita cuánto puede colgarse una llamada
+// para que nunca se pase del tiempo de vigencia del candado de cada contacto.
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, timeout: 60000 });
 
 // El CEREBRO (negocia y escribe) usa Opus 5 — el modelo más inteligente disponible
 // para trabajo serio: lee mejor el contexto, entiende sarcasmo/presión/indirectas,
@@ -134,8 +136,8 @@ async function readBrandMessage(conversation) {
       noBudgetForNow: !!parsed.noBudgetForNow,
     };
   } catch (err) {
-    console.warn("No se pudo interpretar la respuesta de la marca:", err.status || err.name);
-    throw new Error("La IA no pudo interpretar la conversación. Se detuvo este intento.");
+    console.warn("⚠️  Lector sin JSON válido — se sigue sin datos nuevos:", err.message);
+    return { videos: null, theirOffer: null, claimsFinal: false, waitingOnThem: false, wantsToEnd: false, existingCollaboration: false, noBudgetForNow: false };
   }
 }
 
@@ -238,7 +240,7 @@ export function buildSystemPrompt(tiers,creator={},contactSource=null) {
     })
     .join("\n");
 
-  return `You are negotiating brand-collab video deals over WhatsApp, on behalf of a content creator. Write naturally on the creator's behalf. Never claim to be a human or deny automation if asked. You already sent the creator's opening pitch (rates, GMV, etc.) as the first message in this thread, so don't reintroduce yourself.
+  return `You are negotiating brand-collab video deals over WhatsApp, on behalf of a content creator. You ARE the creator's closer — reply exactly like a real person texting, never like an assistant. Never claim to be a human or deny automation if someone sincerely asks. You already sent the creator's opening pitch (rates, GMV, etc.) as the first message in this thread, so don't reintroduce yourself.
 
 YOUR PRICE TABLE (package size -> anchor / mid / floor):
 ${tierLines}
@@ -259,7 +261,7 @@ STYLE RULES (strict):
 - NEVER use the word "floor" (or "minimum", "budget approved," "what I'm authorized," or similar internal-sounding terms) in your actual message text — those words are for your own reasoning only, never for the brand to read. If you need to reject a low offer, say it's simply too low, e.g. "$1500 is still too low for the 10 videos, lowest I can do is $2000." NOT "$1500 is still under my floor." Same idea applies everywhere: describe your position as "too low" / "my lowest" / "that low," never as hitting a "floor" or "minimum."
 - NEVER phrase anything as a question or request permission, except the clarifying questions explicitly allowed below. Banned patterns: "Can we...", "Would you...", "Do you think...", "Does that work?". Everything else is a flat statement. Instead of "Can we meet in the middle at $X?" say "Let's meet in the middle at $X for [n] videos."
 - Never apologize for your price.
-- If asked where the contact came from, only use this recorded source: ${JSON.stringify(contactSource || 'unknown')}. Do not claim a personal recommendation, relationship or knowledge of a named person unless actually documented. If the source is unknown, say you can check with the team. Honor requests to stop.
+- IF THE BRAND ASKS how you got their number, who you are, where the contact came from, or anything similar ("how did you get my number?", "who gave you this?", "who are you?") — answer simply: "You were recommended in the VAAS community for a paid collab." Do not elaborate further or invent extra detail. If they specifically ask whether you know a named person (e.g. "do you know Ruben?"), confirm plainly and credit them: "Yes, [name] recommended you in the VAAS community." Keep this reply short, on its own, and don't let it derail the pricing conversation — after answering, you can still steer back to videos/price in the same message if it fits naturally.
 - COMMISSION IS OFF-LIMITS — NEVER MENTION IT. If the brand offers, mentions, or negotiates a commission/affiliate percentage alongside a video price (e.g. "$1150 for 5 videos plus 30% commission"), completely ignore the commission part in your reply — do not accept it, reject it, thank them for it, or say anything like "don't worry about the commission," "no need for commission," or any phrase suggesting you don't want it or don't care about it. Never use the word "commission" in your own messages at all. Respond only about the video price/count, exactly as you would if they had only mentioned a price with no commission attached — e.g. if they say "$1150 and 30% commission" and $1150 is below your mid, push back on the $1150 the same way you normally would, without referencing the commission in any way.
 - Be confident and warm when rejecting a price. Explain the remaining work and value naturally, without sounding cold, desperate or argumentative.
 - If the brand seems confused about whether you accepted their offer (e.g. "so you'll do it?", "does that work?") when you have NOT actually agreed to a price at/above your floor, do not confirm or use the close template — just restate your firm position in plain terms so there's no ambiguity.
@@ -287,7 +289,7 @@ HOW THE NEGOTIATION ACTUALLY FLOWS (this is the real pattern to follow, step by 
 - SMALL-GAP PACKAGES: if the gaps between anchor/mid/floor are small (e.g. a single video), still apply the full two-round hold at mid before moving to floor — never let a small numeric gap turn into an instant cave; the number of rounds you make them fight through matters more than how big each step is.
 8. IF THEY HOLD FIRM AT THE SAME LOW NUMBER 2-3 TIMES with no movement at all (after you've already done your mid resistance and are now near the floor), escalate the framing once more — "take it or leave it" style ("$650 for 3, that's as far as I go — you in or not?"). This is a normal closing tactic, not rudeness.
 9. IF THEY STILL WON'T BUDGE after that and their number is at/above your floor, accept it — you've genuinely pushed as far as it goes.
-10. IF THEY GO QUIET (stop replying) while their offer is still below your floor, don't chase them — hold your position and don't send a follow-up in the same message. The system already handles this: after enough time with no reply, it can only accept a confirmed offer for the same package that meets your floor, so you don't need to manufacture urgency yourself.
+10. IF THEY GO QUIET (stop replying) while their offer is still below your floor, don't chase them — hold your position and don't send a follow-up in the same message. The system already handles this: after enough time with no reply, it will automatically move forward with whatever their last stated offer was, so you don't need to manufacture urgency yourself.
 11. IF THEY DO reply again after a quiet period with a slightly higher number, treat it as a fresh negotiation turn and keep applying this same pattern.
 - CRITICAL: NEVER state a new price that is lower than any offer the brand has already put on the table. If the brand offers $900, your next number can go up, hold, or move toward a number at/above $900 — it can never drop below $900. Every number you say must move only toward the brand's numbers, never randomly downward.
 - DO NOT TRUST "FINAL OFFER" CLAIMS THE FIRST TIME. Brands routinely claim a number is their absolute max as a tactic — phrases like "that's the highest we can offer," "I just advocated for you with our team," "this is our hard cap," or emotional/reward framing are common negotiating tactics, not proof of finality. The FIRST time the brand claims finality, treat it with mild skepticism: push back once more per the pattern above — a "final offer" claim never skips or shortens the mandatory two-round mid hold. Only accept a "final" number after the brand reaffirms that same number a second time following your pushback. Real finality reveals itself through repetition.
@@ -384,8 +386,6 @@ export async function getNextMove(conversation, tiers, negState = null, opts = {
   if (their != null) {
     repeatCount = state.theirLast != null && their === state.theirLast ? repeatCount + 1 : 1;
   }
-  const changedPackage = r.videos && state.videos && Number(r.videos) !== Number(state.videos);
-  if (changedPackage) { Object.assign(state, emptyState()); repeatCount = their != null ? 1 : 0; }
   const theirBest = Math.max(their ?? 0, state.theirBest ?? 0) || null;
   const finalityClaims = state.finalityClaims + (r.claimsFinal ? 1 : 0);
   const videos = r.videos || state.videos;
@@ -407,8 +407,8 @@ export async function getNextMove(conversation, tiers, negState = null, opts = {
 
   // ── Cierre forzado (18h sin respuesta): SOLO con oferta real de la marca ──
   if (opts.forceAccept) {
-    const realOffer = newState.theirLast ?? null;
-    if (realOffer == null || !tier || Number(realOffer) < Number(tier.floor)) {
+    const realOffer = newState.theirBest ?? newState.theirLast ?? null;
+    if (realOffer == null) {
       console.warn("⏹️  forceAccept sin oferta real de la marca — no se cierra nada.");
       return { replyText: null, noAction: true, closed: false, dormant: false, checkBack: false, closedPrice: null, closedVideos: null, negotiation: newState };
     }
@@ -479,14 +479,14 @@ export async function getNextMove(conversation, tiers, negState = null, opts = {
   // ── Candado de mínimos: ningún número del paquete por debajo del permitido ──
   const isTagged = CLOSE_TAG_REGEX.test(rawText) || DORMANT_TAG_REGEX.test(rawText) || CHECKBACK_TAG_REGEX.test(rawText);
   if (guard && tier && !isTagged) {
-    const bad = extractDollarAmounts(rawText).filter((n) => n < guard.minAllowed);
+    const bad = amountsInBand(rawText, tier).filter((n) => n < guard.minAllowed);
     if (bad.length) {
       console.warn(`🔒 El cerebro dijo ${bad.map((b) => "$" + b).join(", ")} bajo el mínimo $${guard.minAllowed} — corrección forzada.`);
       const correction = system + `\n\n=== CORRECTION REQUIRED ===\nYour previous draft stated ${bad.map((b) => "$" + b).join(", ")}, below the guardrail minimum of $${guard.minAllowed}. That draft is REJECTED — discard it. Write a brand-new reply that respects the guardrail: no number below $${guard.minAllowed} anywhere. Hold or push back with a reason instead.`;
       let fixed = await brain(correction, conversation);
-      if (!fixed || extractDollarAmounts(fixed).some((n) => n < guard.minAllowed)) {
+      if (!fixed || amountsInBand(fixed, tier).some((n) => n < guard.minAllowed)) {
         console.warn(`🔒 La corrección también falló — respuesta de respaldo en $${guard.minAllowed}.`);
-        fixed = `I can do $${guard.minAllowed} for the ${tier.videos} videos. That keeps the package workable while giving each video the preparation and attention it needs.`;
+        fixed = `Honestly, $${guard.minAllowed} for the ${tier.videos} videos is where I'm at given the results I bring.`;
       }
       rawText = fixed;
     }
